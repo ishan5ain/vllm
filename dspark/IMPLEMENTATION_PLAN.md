@@ -169,30 +169,54 @@ Two approaches:
 - Override `propose()` to run the full block draft
 - Integrate with vLLM's `MultiStepWorker` or create a new worker
 
-### Phase 4: Confidence-Based Pruning (Optional v1)
+### Phase 4: Scheduling Improvements (Phased — Slack guidance)
 
-**Goal:** Use confidence scores to dynamically trim verification length.
+Per Slack discussion (Kaichao You, Benjamin Chislott, Michael Goin, 2026-06-27),
+the verification scheduling should be implemented in tiers, starting simple:
+
+#### Tier 1: Fixed Global Verification Length (start here)
+- Always verify all γ=5 draft tokens
+- No CUDA graph issues — uniform batch shapes
+- DSpark's draft quality improvements alone deliver 16-30% over DFlash
+- This is sufficient for initial deployment and matches standard MTP behavior
+
+#### Tier 2: Per-Batch Averaged Truncation
+- Compute per-request confidence scores during drafting
+- Average the optimal lengths across the batch to get a single `num_spec_tokens`
+- Preserves CUDA graph compatibility (uniform batch shapes)
+- Pattern: vLLM PR #45953 ("dynamic SD with static num spec tokens per batch")
 
 ```python
-def confident_prefix_length(confidence_logits, threshold=0.5):
-    """From DeepSpec: deepspec/eval/dspark/draft_ops.py"""
-    probs = confidence_logits.sigmoid()
-    below = probs < threshold
-    if not below.any():
-        return len(probs)
-    return below.nonzero()[0].item()  # first position below threshold
+# Per-request confidence → per-batch average
+def compute_batch_verification_length(confidence_logits_batch, threshold=0.5):
+    lengths = []
+    for logits in confidence_logits_batch:
+        probs = logits.sigmoid()
+        below = (probs < threshold).nonzero()
+        lengths.append(below[0].item() if len(below) > 0 else len(probs))
+    return max(1, int(sum(lengths) / len(lengths)))  # average
 ```
 
-### Phase 5: STS Calibration (Optional)
+#### Tier 3: Per-Request Variable Lengths (requires varlen kernel support)
+- FlashInfer/DeepGEMM indexer reportedly supports varlen
+- Loses CUDA graph compatibility for the attention portion
+- Only worth it if profiling shows verification waste is a bottleneck
 
-**Goal:** Calibrate confidence scores for accurate throughput estimation.
+#### Tier 4: Full DSpark Hardware-Aware Prefix Scheduler
+- Algorithm 1 from paper: global throughput maximization with SPS(B) profiling
+- Requires the asynchronous adaptation (Section 5.2) for ZOS compatibility
+- Necessary only at DeepSeek-scale production (200+ concurrent requests)
+- Reference: `dspark/sts_calibration.py` for confidence calibration
 
-The paper's STS (Sequential Temperature Scaling) temperatures are **not included** in the checkpoint.
+### Phase 5: STS Calibration (needed for Tiers 2-4)
+
+The paper's STS (Sequential Temperature Scaling) temperatures are not in the checkpoint.
+See `dspark/sts_calibration.py` for a complete implementation.
 
 Options:
-1. Skip calibration — raw confidence has 3-8% ECE (disk vs. reality)
-2. Recalibrate on a small held-out validation set
-3. Use a fixed temperature of 1.0 (no scaling)
+1. **Skip calibration** (Tier 1) — raw confidence usable without temperatures
+2. **Recalibrate on held-out set** — 1000-5000 samples, ~milliseconds CPU time
+3. **Use identity** `[1.0, 1.0, 1.0, 1.0, 1.0]` — same as raw sigmoid, works for ranking
 
 ## Checkpoint Anatomy
 
@@ -239,10 +263,48 @@ num_experts_per_tok: 6            # Top-K routing
 | `deepspec/eval/dspark/confidence_head.py` | ConfidenceHeadRecorder, calibration metrics |
 | `config/dspark/dspark_qwen3_4b.py` | Training config (Qwen3 baseline) |
 
+## Slack Discussion Insights (2026-06-27)
+
+A Slack thread between Kaichao You, Benjamin Chislott, and Michael Goin (vLLM contributors)
+discussed DSpark integration and surfaced practical guidance:
+
+**Key takeaways:**
+
+1. **Draft quality vs. scheduling are separable.** DSpark's semi-autoregressive head improves
+draft quality independently of the confidence scheduler. The draft quality gains (16-30% over
+DFlash, 27-31% over Eagle3) can be realized even with fixed-length verification.
+
+2. **Simpler scheduling first.** The DSpark paper's Hardware-Aware Prefix Scheduler (Algorithm 1)
+is complex and may be overkill for initial integration. The recommended phased approach:
+   - **Tier 1 (start here):** Fixed global verification length — just use DSpark's better draft quality
+   - **Tier 2:** Per-request confidence score → average across batch (preserves CUDA graph compat)
+   - **Tier 3:** Per-request variable verification lengths (requires varlen kernel support)
+   - **Tier 4:** Full DSpark-style optimal scheduling with SPS profiling
+
+3. **CUDA graph compatibility is the hard constraint.** Michael Goin confirmed that losing
+   full CUDA graph compatibility "hurt a lot" in his jump decoding speculator. Any
+   variable-length approach must maintain uniform batch shapes to keep CUDA graphs.
+
+4. **PR #45953 is prior art in vLLM.** Benjamin Chislott linked to an existing vLLM PR for
+   "dynamic SD for MRV2 with static num spec tokens per batch" — variable per-request
+   but fixed per-batch, preserving CUDA graph compatibility. This is the Tier 2 approach.
+
+5. **Conservative policy for high batch sizes.** Benjamin Chislott proposed splitting
+   requests into top-50% (max spec len) and bottom-50% (min spec len) at high concurrency
+   where verification cost matters most. Granularity across many requests smooths out
+   the throughput curve.
+
+**Impact on our plan:** The DSpark paper's full scheduler was necessary at DeepSeek's
+production scale (200+ concurrent requests where verification waste crippled throughput).
+For smaller deployments and initial integration, Tiers 1-2 likely capture most gains.
+We should implement in that order and add the scheduler only if profiling shows
+verification waste as a bottleneck.
+
 ## Open Questions
 
-1. **STS calibration temperatures** — Not in checkpoint. Can we get these from DeepSeek, or must we recalibrate?
+1. **STS calibration temperatures** — Not in checkpoint. Can we get these from DeepSeek, or must we recalibrate? (→ See `sts_calibration.py` for the implementation)
 2. **num_nextn_predict_layers override** — Should we add `dspark_num_layers: 3` to config, or repurpose `num_nextn_predict_layers`?
-3. **vLLM speculative runner changes** — DSpark produces all γ tokens in one draft pass. Does the existing multi-step runner support this, or do we need a specialized `DSparkWorker`?
+3. **vLLM speculative runner changes** — DSpark produces all γ tokens in one draft pass. Does the existing multi-step runner support this, or do we need a specialized `DSparkWorker`? (→ PR #45953 may provide a pattern)
 4. **Bidirectional block attention** — vLLM's attention backends may need a new code path or flag. Is `is_causal=False` sufficient for all backends (FlashInfer, FlashAttn, etc.)?
 5. **Memory** — The DSpark checkpoint adds ~2 extra safetensors (~8GB). The 3 MTP layers with 256 experts each will have substantial memory overhead.
+6. **Scheduling tier** — What tier is appropriate for our use case? (→ See Slack discussion above: start Tier 1, can iterate upward)

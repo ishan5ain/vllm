@@ -54,5 +54,8 @@ Fetched from `https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/raw/ma
    - (B) Create `DeepSeekV4DSpark` as a parallel class — cleaner separation, less risk
    - Recommend: (B) to avoid breaking existing MTP. Share weight loading helpers where possible.
 
-4. **Confidence scheduling**: Phase 4 (optional). Start with static `γ=5` verification, add
-   confidence-based pruning later.
+4. **Scheduling phasing** (per Slack discussion, 2026-06-27):
+   - **Tier 1 (start here):** Fixed γ=5 verification — draft quality gains alone are significant
+   - **Tier 2:** Per-batch averaged truncation from confidence scores (CUDA graph safe, see vLLM PR #45953)
+   - **Tier 3:** Per-request variable lengths (requires varlen kernel support)
+   - **Tier 4:** Full DSpark Hardware-Aware Prefix Scheduler (DeepSeek production scale only)
