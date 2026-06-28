@@ -557,6 +557,15 @@ class DSparkInnerModel(nn.Module):
         def _remap_weight_name(name: str) -> str:
             for old_pattern, new_pattern in WEIGHT_NAME_REMAPPING.items():
                 if old_pattern in name:
+                    # Guard: .norm.weight matches kv_norm, q_norm,
+                    # attn_norm, ffn_norm — only remap the output norm.
+                    if old_pattern == ".norm.weight" and (
+                        "attn_norm" in name
+                        or "ffn_norm" in name
+                        or "kv_norm" in name
+                        or "q_norm" in name
+                    ):
+                        continue
                     name = name.replace(old_pattern, new_pattern)
             return name
 
@@ -608,9 +617,6 @@ class DSparkInnerModel(nn.Module):
         )
 
         for name, loaded_weight in weights:
-            # Log DSpark-relevant weights for debugging.
-            if name.startswith("mtp."):
-                logger.info("DSpark mtp weight: %s", name)
             mtp_layer_idx = _find_mtp_layer_idx(name)
             name = name.replace(
                 f"mtp.{mtp_layer_idx}.",
@@ -709,12 +715,6 @@ class DSparkInnerModel(nn.Module):
             )
             if spec_layer is not None:
                 loaded_layers.add(spec_layer)
-        logger.info(
-            "DSpark draft model: config.num_nextn_predict_layers=%d, "
-            "loaded_layers=%s",
-            self.config.num_nextn_predict_layers,
-            sorted(loaded_layers),
-        )
         for layer_idx in range(
             self.mtp_start_layer_idx,
             self.mtp_start_layer_idx + self.num_mtp_layers,
@@ -783,7 +783,7 @@ class DSparkInnerModel(nn.Module):
             # Decoder-block weights go under layers.{idx}.mtp_block.*
             name = name.replace(
                 f"model.layers.{spec_layer}.",
-                f"layers.{spec_layer}.mtp_block.",
+                f"model.layers.{spec_layer}.mtp_block.",
             )
         elif shared_weight:
             # Top-level shared weights (embed, Markov, confidence, fc)
@@ -794,7 +794,7 @@ class DSparkInnerModel(nn.Module):
             # shared_head, hc_head_*) live under layers.{idx}.*
             name = name.replace(
                 f"model.layers.{spec_layer}.",
-                f"layers.{spec_layer}.",
+                f"model.layers.{spec_layer}.",
             )
         return name
 
