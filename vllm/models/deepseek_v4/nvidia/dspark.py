@@ -608,18 +608,16 @@ class DSparkInnerModel(nn.Module):
         )
 
         for name, loaded_weight in weights:
+            # Log DSpark-relevant weights for debugging.
+            if name.startswith("mtp."):
+                logger.info("DSpark mtp weight: %s", name)
             mtp_layer_idx = _find_mtp_layer_idx(name)
-            # Only log the first few weights per layer for debugging.
-            if mtp_layer_idx in (1, 2) and "enorm" in name:
-                logger.info("DSpark weight: %s -> mtp_layer_idx=%d", name, mtp_layer_idx)
             name = name.replace(
                 f"mtp.{mtp_layer_idx}.",
                 f"model.layers.{self.config.num_hidden_layers + mtp_layer_idx}.",
             )
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if mtp_layer_idx in (1, 2) and spec_layer is None:
-                logger.info("DSpark weight SKIPPED (spec_layer=None): %s", name)
             if spec_layer is None:
                 continue
 
