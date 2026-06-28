@@ -66,6 +66,31 @@ The `DeepSeek-V4-Flash-DSpark` checkpoint is the same V4-Flash base model with a
 
 ## Implementation Steps (Priority Order)
 
+### Phase 0: Prerequisites (New — from GB10 recipe analysis)
+
+See `dspark/gb10_recipes_analysis.md` for full details. Target the **standard recipe**
+(`vllm-node` container, Ray executor, default backends). These must be verified
+before writing DSpark model code.
+
+- [ ] **Memory budget measurement:**
+  - Load base `DeepSeek-V4-Flash` on a single GB10 node via the standard recipe.
+  - Record available memory via `nvidia-smi`.
+  - Estimate whether ~8 GB draft model fits at `gpu_memory_utilization=0.8`
+    (128 GB total, ~102 GB usable).
+  - If not, evaluate: reduced `max_num_seqs` (currently 4), reduced `max_model_len`
+    (currently 500K), or slightly lower `gpu_memory_utilization`.
+- [ ] **Draft model TP strategy:**
+  - Draft model runs TP=1 on each rank (identical computation, no all-reduce).
+  - Verify `DraftModelProposer._raise_if_draft_tp_mismatch()` behavior when draft TP=1
+    and target TP=2. May need an override or DSpark-specific proposer subclass.
+- [x] **Backend compatibility:** Not a concern for the standard recipe.
+  - FlashInfer supports `is_causal=False` (bidirectional attention).
+  - Standard mHC Python path available. No b12x custom kernels involved.
+  - Standard linear ops. No AOT compile.
+- [ ] **Speculative config integration:**
+  - Map DSpark into vLLM's speculative method registry so `method: "dspark"` works.
+  - Plan: `num_speculative_tokens: 5` (matching γ=5).
+
 ### Phase 1: Model Loading (Critical)
 
 **Goal:** Load the DSpark checkpoint weights correctly.
@@ -73,6 +98,10 @@ The `DeepSeek-V4-Flash-DSpark` checkpoint is the same V4-Flash base model with a
 **Current state:** The existing `DeepSeekV4MTP.load_weights()` only loads 1 MTP layer
 (because `num_nextn_predict_layers=1` in config). The DSpark checkpoint has 3 layers
 (mtp.0, mtp.1, mtp.2), plus markov/confidence head weights on mtp.2.
+
+**Approach:** New parallel class `DeepSeekV4DSpark` in `vllm/models/deepseek_v4/nvidia/dspark.py`.
+Shares `DeepseekV4DecoderLayer` via import (no code duplication). Separate class avoids
+breaking existing MTP behavior.
 
 **Required changes:**
 
@@ -156,6 +185,10 @@ class DeepSeekV4DSparkModel(nn.Module):
 ### Phase 3: Integration with Speculative Decode Runner
 
 **Goal:** Hook DSpark into vLLM's speculative decoding pipeline.
+
+**Note on backends:** The standard recipe uses default vLLM backends (FlashInfer for
+attention, flashinfer_cutlass for MoE). No b12x custom kernels involved. FlashInfer
+supports bidirectional attention. See `dspark/gb10_recipes_analysis.md`.
 
 Two approaches:
 

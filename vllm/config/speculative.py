@@ -64,6 +64,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "dspark",
     EagleModelTypes,
     NgramGPUTypes,
 ]
@@ -321,11 +322,23 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
             )
         if hf_config.model_type == "deepseek_v4":
-            hf_config.model_type = "deepseek_mtp"
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
-            )
+            if hasattr(hf_config, "dspark_block_size"):
+                # DSpark checkpoint detected — override to dspark method
+                hf_config.model_type = "deepseek_dspark"
+                n_predict = getattr(hf_config, "dspark_block_size", 5)
+                hf_config.update(
+                    {
+                        "n_predict": n_predict,
+                        "num_nextn_predict_layers": 3,
+                        "architectures": ["DeepSeekV4DSparkModel"],
+                    }
+                )
+            else:
+                hf_config.model_type = "deepseek_mtp"
+                n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+                hf_config.update(
+                    {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
+                )
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
         if hf_config.model_type == "pangu_ultra_moe_mtp":

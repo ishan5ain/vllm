@@ -1021,8 +1021,17 @@ class DeepseekV4Model(nn.Module):
                 self.hc_dim,
                 dtype=vllm_config.model_config.dtype,
             )
+            # DSpark context buffer: concatenated hidden states from
+            # target layers 40, 41, 42. Shape: [max_tokens, 3 * hidden_size].
+            # Populated during forward() for the DSpark draft model.
+            self._dspark_context_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                3 * self.config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+            )
         else:
             self._mtp_hidden_buffer = None
+            self._dspark_context_buffer = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1068,7 +1077,12 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        dspark_target_layers = {40, 41, 42}
+        dspark_context_parts: list[torch.Tensor] = []
+        for local_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            global_idx = self.start_layer + local_idx
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1077,6 +1091,16 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            # Capture per-layer hidden states for DSpark context.
+            # Use the first hc_mult stream as the single 4096-dim
+            # representation per position.
+            if (
+                global_idx in dspark_target_layers
+                and self._dspark_context_buffer is not None
+            ):
+                dspark_context_parts.append(
+                    hidden_states[:, 0, :]  # [T, hidden_size]
+                )
         if layer is not None:
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix
@@ -1084,6 +1108,13 @@ class DeepseekV4Model(nn.Module):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
+
+        # Stash DSpark context (layers 40,41,42 concatenated) for the
+        # DSpark draft model. Concatenate along the hidden dimension.
+        if dspark_context_parts and self._dspark_context_buffer is not None:
+            dspark_ctx = torch.cat(dspark_context_parts, dim=-1)  # [T, 3*D]
+            num_tokens = dspark_ctx.shape[0]
+            self._dspark_context_buffer[:num_tokens].copy_(dspark_ctx)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -1401,10 +1432,17 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
         return hidden_states
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
-        """Pre-hc_head residual stream buffer (max_num_batched_tokens,
-        hc_mult * hidden_size) for the MTP draft model. Populated by
-        forward(); valid after each target step."""
+        """Pre-hc_head residual stream buffer for the MTP draft."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def get_dspark_context_hidden_states(self) -> torch.Tensor | None:
+        """Concatenated hidden states from target layers 40,41,42.
+
+        Shape: [max_num_batched_tokens, 3 * hidden_size].
+        Populated during forward(); valid after each target step.
+        Used by the DSpark speculator for context projection.
+        """
+        return getattr(self.model, "_dspark_context_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
