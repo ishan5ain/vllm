@@ -3,8 +3,9 @@
 > **Date:** 2026-06-28
 > **Branch:** `dspark-research` (fork: `github.com/ishan5ain/vllm`)
 > **Latest commit:** `d4d66dfee` — hc_head fix (3D backbone, pending cluster test)
-> **Uncommitted:** `load_weights` completeness assertion in `dspark.py` (this session) — not yet committed/built
-> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause
+> **Uncommitted:** architecture rewire A/B/D/E/F + completeness assertion in
+>   `dspark.py`/`model.py` (this session) — lint-clean, NOT yet committed/built/tested
+> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire
 
 ## Implementation Status
 
@@ -41,14 +42,24 @@ fabricated and stay randomly initialized, which forces 0% acceptance:
 Full verified mapping, data flow, and the A–F fix table: see
 `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING".
 
-**Guardrail added (`load_weights`):** a completeness assertion now hard-fails and
+**Guardrail added (`load_weights`):** a completeness assertion hard-fails and
 lists every parameter with no checkpoint source (token embedding + tied head
-exempt). On the current architecture it raises by design — preventing a build
-from serving random projections at guaranteed 0% acceptance. It will pass once
-fixes A/B/E land.
+exempt). After the rewire below it PASSES — every draft param has a real weight.
 
-Prior hypothesis (hc_head identical-copies bug) below remains valid but was only
-one of several issues; it could not have raised acceptance above 0% on its own.
+### Architecture rewire — DONE this session (A/B/D/E/F), uncommitted/untested
+
+| Fix | Change | File |
+|---|---|---|
+| A | Removed fabricated `fc`; context proj = `mtp.0.main_proj` (fp8) + `mtp.0.main_norm` (now load) | `dspark.py` |
+| B | Removed `enorm`/`hnorm`/`e_proj`/`h_proj`; embeddings feed blocks directly | `dspark.py` |
+| D | Context capture = `mhc_post` + mean over hc_mult (ref `h.mean(dim=2)`) | `model.py` |
+| E/F | Dropped dead `.emb.tok_emb`/`.head.weight` remaps; `mtp.2.norm`→`shared_head.norm`; embed+head shared | `dspark.py` |
+| C | **INTERIM** — `main_x` added to anchor embedding. Proper cross-attention designed in `dspark/phase_cd_plan.md`, NOT implemented | `dspark.py` |
+
+Lint-clean (ruff check + format). Not built/tested — cluster build is the test.
+
+Prior hypothesis (hc_head identical-copies bug) remains valid but was only one of
+several issues; it could not have raised acceptance above 0% on its own.
 
 ### Acceptance Rate Bug (found 2026-06-28)
 
@@ -159,12 +170,11 @@ vllm/model_executor/layers/sparse_attn_indexer.py  cooperative_topk Blackwell fi
 
 | Gap | Severity | Notes |
 |---|---|---|
-| **Architecture mismatch vs checkpoint** | **BLOCKER** | `fc`/`enorm`/`hnorm`/`e_proj`/`h_proj` fabricated & random; `main_proj`/`main_norm` skipped. See A–F in `checkpoint_anatomy.md`. Causes 0% acceptance. |
-| Context projection random (`fc`) | **BLOCKER** | RESOLVED-to-spec: real source is `mtp.0.main_proj`+`main_norm`; code not yet rewired (fix A) |
-| Target context capture wrong | **BLOCKER** | Uses `hidden[:,0,:]`; must be `h.mean(dim=2)` (fix D) |
-| Head/norm remap to non-existent `shared_head` | **HIGH** | Use shared `head.weight` + `mtp.2.norm.weight` (fix E) |
-| Acceptance rate unverified | **HIGH** | Cannot exceed 0% until A/B/D/E land |
-| Markov head correctness | Medium | Verified against paper + reference `forward_head` — logic correct; blocked by upstream garbage inputs |
+| Architecture mismatch vs checkpoint | RESOLVED (untested) | A/B/D/E/F rewired this session; assertion passes. Needs cluster build. |
+| **Context via cross-attention (fix C)** | **HIGH** | Only INTERIM (embedding add) in place. Proper per-stage `main_kv` cross-attention pending — see `dspark/phase_cd_plan.md`. Likely caps acceptance until done. |
+| Acceptance rate unverified | **HIGH** | Build A/B/D/E/F; expect low-but-maybe-nonzero with interim C; >3/5 needs proper C |
+| `main_proj` fp8 scale loading | Medium | Expects `main_proj.weight_scale_inv`; verify on first build |
+| Markov head correctness | Medium | Verified against paper + reference `forward_head` — logic correct; depends on correct inputs (now wired) |
 | Confidence head unused | Medium | Scores computed but Phase 4 scheduling not implemented |
 | No DSpark CUDA graphs | Medium | Main model has PIECEWISE graphs; speculator runs eagerly |
 | Bidirectional attention | Medium | `causal=False` set, not validated at runtime |
@@ -192,15 +202,13 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Next Steps (Priority Order)
 
-1. **Rewire the draft to the real checkpoint layout** — fixes A–F in
-   `checkpoint_anatomy.md`. Minimum for >0% acceptance: A (main_proj/main_norm as
-   context proj), B (drop enorm/hnorm/e_proj/h_proj), C (main_x cross-attn),
-   D (mean-over-hc context capture), E (head/norm remap). The `load_weights`
-   assertion gates this — it passes only when no parameter is left random.
-2. **Cluster test** — build will now fail fast if any weight is unsourced;
-   once it loads, benchmark acceptance vs MTP baseline (~2.2/2); target >3/5.
-3. **Verify Markov head end-to-end** — confirm W₁W₂ sampling matches reference
-   `forward_head` once inputs are correct.
+1. **Build & cluster-test the A/B/D/E/F rewire** — confirm load (assertion
+   passes), serving, and measure acceptance with interim C. Watch the
+   `main_proj` fp8 scale + the 3 extra `mhc_post` calls (fix D).
+2. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
+   — per-stage one-token `main_kv` prefill into the draft KV cache; remove the
+   interim embedding add. Target >3/5 acceptance.
+3. **Verify Markov head end-to-end** vs reference `forward_head`.
 4. **Phase 3b: DSpark CUDA graphs** — build `DSparkCudaGraphManager` (see `phase3_cudagraph_plan.md`)
 5. **Phase 4: Confidence-based scheduling** — integrate confidence head
 6. **Phase 5: STS calibration** — run `dspark/sts_calibration.py`

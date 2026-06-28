@@ -1091,21 +1091,21 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-            # Capture per-layer hidden states for DSpark context.
-            # Use the first hc_mult stream as the single 4096-dim
-            # representation per position.
+            # Capture per-layer hidden states for DSpark context (fix D).
+            # The reference (inference/model.py Transformer.forward) captures
+            # the FULL post-mHC layer output averaged over the hc_mult streams
+            # (``h.mean(dim=2)``). In this fused design mhc_post is deferred to
+            # the next layer's mhc_pre, so the mid-loop ``hidden_states`` is the
+            # pre-mapping FFN output. Apply mhc_post here NON-destructively to
+            # reconstruct the full per-layer output, then mean over hc_mult.
             if (
                 global_idx in dspark_target_layers
                 and self._dspark_context_buffer is not None
             ):
-                # hidden_states may be 2D [T, D] or 3D [T, hc_mult, D];
-                # select the first stream when 3D, use as-is when 2D.
-                single_stream = (
-                    hidden_states[:, 0, :]
-                    if hidden_states.dim() == 3
-                    else hidden_states
-                )
-                dspark_context_parts.append(single_stream)
+                full = mhc_post_tilelang(
+                    hidden_states, residual, post_mix, res_mix
+                )  # [T, hc_mult, D]
+                dspark_context_parts.append(full.mean(dim=1))  # [T, D]
         if layer is not None:
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix

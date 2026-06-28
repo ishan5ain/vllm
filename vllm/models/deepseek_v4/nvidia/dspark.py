@@ -10,20 +10,23 @@ DSpark extends the DFlash parallel draft model with:
    acceptance probabilities.
 3. **Bidirectional block attention** (is_causal=False) within the draft block.
 
-This file implements Phase 1 (model loading and weight mapping). The
-Markov sequential sampling and confidence head forward pass are stubbed
-for Phase 2.
+Architecture (verified against the checkpoint's ``inference/model.py`` —
+``DSparkBlock``/``Transformer.forward_spec``; see
+``dspark/checkpoint_anatomy.md`` → "✅ VERIFIED MAPPING"):
 
-Key differences from ``mtp.py``:
-- 3 draft layers (mtp.0, mtp.1, mtp.2) instead of 1
-- DSpark-specific heads: markov_w1, markov_w2, confidence_proj, fc
-- Bidirectional attention within the draft block (not yet wired)
-- Target context extraction from layers 40, 41, 42 (not yet wired)
+- 3 stages (mtp.0, mtp.1, mtp.2), each a standard ``DeepseekV4DecoderLayer``.
+  There is **no** enorm/hnorm/e_proj/h_proj — token embeddings feed the
+  blocks directly.
+- Input stage (mtp.0): ``main_proj`` + ``main_norm`` project the concatenated
+  target context (layers 40,41,42) into ``main_x`` (the former, fabricated
+  ``fc`` weight).
+- Output stage (mtp.2): ``hc_head_*`` + ``shared_head`` (pre-head norm
+  ``mtp.2.norm`` + tied LM head shared from target) + Markov/confidence heads.
+- Token embedding and the LM head are shared from the target model.
 
-References:
-- ``dspark/dspark_model_skeleton.py`` — class structure
-- ``dspark/checkpoint_anatomy.md`` — weight key mappings
-- DeepSeek DSpark paper (Section 3)
+Known gap (fix C, pending — not blind-coded): target context should enter via
+DSparkAttention cross-attention (per-stage ``main_kv`` in the draft KV cache),
+not by adding to the anchor embedding. See ``dspark/phase_cd_plan.md``.
 """
 
 import typing
@@ -60,7 +63,6 @@ from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v4.common.ops import (
-    fused_mtp_input_rmsnorm,
     mtp_shared_head_rmsnorm,
 )
 from vllm.sequence import IntermediateTensors
@@ -78,19 +80,21 @@ _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
 class DeepSeekV4DSparkLayer(nn.Module):
-    """Single DSpark backbone layer.
+    """Single DSpark backbone stage.
 
-    Reuses ``DeepseekV4DecoderLayer`` (the same decoder block used by the
-    target model and standard MTP) with DSpark-specific projection heads.
+    Matches the checkpoint's ``mtp.{stage}`` layout (verified against
+    ``inference/model.py`` ``DSparkBlock`` — see
+    ``dspark/checkpoint_anatomy.md`` → "✅ VERIFIED MAPPING"). Each stage is a
+    standard ``DeepseekV4DecoderLayer`` (MLA attention + MoE FFN + mHC
+    residuals). DSpark has **no** enorm/hnorm/e_proj/h_proj — token embeddings
+    feed the blocks directly and the target context enters via attention.
 
-    Each layer has:
-    - enorm / hnorm: input RMSNorm for embedding and target context
-    - e_proj / h_proj: separate embedding and context projection (V4-style)
-    - mtp_block: the decoder layer (MLA attention + MoE FFN)
-    - hc_head params: hypercompressed LM head (only on the output layer)
-
-    DSpark requires 3 such layers (mtp.0, mtp.1, mtp.2), where mtp.2 is
-    the output layer with hc_head and shared_head.
+    Stage-specific extras:
+    - Input stage (mtp.0): ``main_proj`` (3·D → D, fp8) + ``main_norm`` — the
+      target-context projection (``main_x``). This is what earlier code called
+      ``fc``; the real weights are ``mtp.0.main_proj`` / ``mtp.0.main_norm``.
+    - Output stage (mtp.2): ``hc_head_*`` + ``shared_head`` (pre-head norm
+      ``mtp.2.norm`` + tied LM head shared from the target).
     """
 
     def __init__(
@@ -100,6 +104,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         prefix: str,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         is_output_layer: bool = False,
+        is_input_layer: bool = False,
     ) -> None:
         super().__init__()
 
@@ -107,26 +112,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         self.config = config
         quant_config = vllm_config.quant_config
         self.rms_norm_eps = config.rms_norm_eps
-
-        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.e_proj = ReplicatedLinear(
-            config.hidden_size,
-            config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.e_proj",
-        )
-        self.h_proj = ReplicatedLinear(
-            config.hidden_size,
-            config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.h_proj",
-        )
+        self.hc_mult = config.hc_mult
 
         self.mtp_block = DeepseekV4DecoderLayer(
             vllm_config,
@@ -135,10 +121,26 @@ class DeepSeekV4DSparkLayer(nn.Module):
             aux_stream_list=aux_stream_list,
         )
 
-        # Only the output layer (mtp.2 equivalent) has hc_head and shared_head.
+        # Input stage (mtp.0) only: target-context projection (main_x).
+        # main_proj is fp8-quantized in the checkpoint (carries a ``.scale``),
+        # so it is created with quant_config like the other V4 linears.
+        if is_input_layer:
+            self.target_layer_ids = getattr(
+                config, "dspark_target_layer_ids", [40, 41, 42]
+            )
+            self.main_proj = ReplicatedLinear(
+                len(self.target_layer_ids) * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.main_proj",
+            )
+            self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Output stage (mtp.2) only: hc_head + shared_head (pre-head norm + LM head).
         if is_output_layer:
             self.hc_eps = config.hc_eps
-            self.hc_mult = config.hc_mult
             self.hc_dim = self.hc_mult * config.hidden_size
             self.hc_head_fn = nn.Parameter(
                 torch.empty(self.hc_mult, self.hc_dim, dtype=torch.float32),
@@ -156,52 +158,29 @@ class DeepSeekV4DSparkLayer(nn.Module):
                 config=config, prefix=prefix, quant_config=quant_config
             )
 
-    def forward(
+    def project_main_context(self, target_context: torch.Tensor) -> torch.Tensor:
+        """main_x = main_norm(main_proj(target_context)).
+
+        Only valid on the input stage (mtp.0). ``target_context`` is the
+        concatenated target hidden states [*, 3·D]; returns [*, D].
+        """
+        return self.main_norm(self.main_proj(target_context))
+
+    def run_block(
         self,
-        input_ids: torch.Tensor,
         positions: torch.Tensor,
-        previous_hidden_states: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
-        spec_step_index: int = 0,
+        hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        assert inputs_embeds is not None
-        is_output = hasattr(self, "hc_head_fn")
-        if is_output:
-            previous_hidden_states = previous_hidden_states.view(
-                -1, self.hc_mult, self.config.hidden_size
-            )
-        else:
-            # Non-output layers receive a flat residual; keep it flat.
-            pass  # hc_mult reshaping not needed for backbone-only layers
+        """Run the decoder block on 3D [*, hc_mult, D] hidden states.
 
-        inputs_embeds, previous_hidden_states = fused_mtp_input_rmsnorm(
-            inputs_embeds,
-            positions,
-            previous_hidden_states,
-            self.enorm.weight.data,
-            self.hnorm.weight.data,
-            self.enorm.variance_epsilon,
-            self.hc_mult if is_output else 1,
-        )
-        if is_output:
-            hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
-                inputs_embeds
-            ).unsqueeze(-2)
-        else:
-            # Non-output layers: h_proj on flat hidden, e_proj on embeds
-            hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
-                inputs_embeds
-            )
-
+        Token embeddings feed the block directly (no input projection). The
+        mHC post-residual mapping is applied here so the returned hidden state
+        is the full per-stage output, ready for the next stage or hc_head.
+        """
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_tilelang(
-            hidden_states, residual, post_mix, res_mix
-        )
-        if is_output:
-            return hidden_states.flatten(1)
-        return hidden_states
+        return mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
 
 
 class DSparkInnerModel(nn.Module):
@@ -254,6 +233,7 @@ class DSparkInnerModel(nn.Module):
                     self.topk_indices_buffer,
                     f"{prefix}.layers.{idx}",
                     aux_stream_list=aux_stream_list,
+                    is_input_layer=(idx == self.mtp_start_layer_idx),
                     is_output_layer=(
                         idx == self.mtp_start_layer_idx + self.num_mtp_layers - 1
                     ),
@@ -292,16 +272,17 @@ class DSparkInnerModel(nn.Module):
             1,
             prefix=maybe_prefix(prefix, "confidence_proj"),
         )
-        # Context projection: 3 target layers × hidden_size → hidden_size
-        self.fc = ReplicatedLinear(
-            len(self.target_layer_ids) * config.hidden_size,
-            config.hidden_size,
-            bias=False,
-            prefix=maybe_prefix(prefix, "fc"),
-        )
+        # Target-context projection lives on the input stage (mtp.0) as
+        # main_proj + main_norm (see DeepSeekV4DSparkLayer). There is no
+        # separate top-level ``fc`` — that was a fabricated weight. Accessed
+        # via the ``input_layer`` property (no duplicate module registration).
 
         # ── Logits processor ──────────────────────────────────────────
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    @property
+    def input_layer(self) -> "DeepSeekV4DSparkLayer":
+        return self.layers[str(self.mtp_start_layer_idx)]
 
     # ═══════════════════════════════════════════════════════════════════
     # Forward pass (compatible with MTPSpeculator step-by-step calling)
@@ -314,25 +295,27 @@ class DSparkInnerModel(nn.Module):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if inputs_embeds is None and input_ids is not None:
+        """Minimal block run for warmup/dummy paths.
+
+        DSpark's real proposal path is ``forward_dspark_block``; this method
+        only needs to be runnable (e.g. for profiling/dummy runs). It embeds
+        the input, expands to hc_mult streams, runs every stage, and returns
+        the flattened output. Token embeddings feed the blocks directly — no
+        input projection (matches the reference architecture).
+        """
+        if inputs_embeds is None:
+            assert input_ids is not None
             inputs_embeds = self.embed_tokens(input_ids)
 
-        current_step_idx = spec_step_idx % self.num_mtp_layers
-        layer_key = str(self.mtp_start_layer_idx + current_step_idx)
-        mtp_layer = self.layers[layer_key]
-
-        return mtp_layer(
-            input_ids,
-            positions,
-            hidden_states,
-            inputs_embeds,
-            current_step_idx,
-        )
+        hidden_states = inputs_embeds.unsqueeze(-2).expand(-1, self.config.hc_mult, -1)
+        for layer_key in sorted(self.layers.keys(), key=int):
+            hidden_states = self.layers[layer_key].run_block(positions, hidden_states)
+        return hidden_states.flatten(1)
 
     def compute_logits(
         self,
@@ -367,28 +350,22 @@ class DSparkInnerModel(nn.Module):
             mtp_layer.shared_head.norm.weight.data,
             mtp_layer.shared_head.norm.variance_epsilon,
         )
-        logits = self.logits_processor(
-            mtp_layer.shared_head.head, hidden_states
-        )
+        logits = self.logits_processor(mtp_layer.shared_head.head, hidden_states)
         return logits
 
     # ═══════════════════════════════════════════════════════════════════
     # DSpark-specific methods (Phase 2+ — stubbed for now)
     # ═══════════════════════════════════════════════════════════════════
 
-    def project_context(
-        self, target_hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        """Project target hidden states from layers 40,41,42 into draft context.
+    def project_context(self, target_hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project concatenated target hidden states [*, 3·D] → [*, D].
 
-        Phase 2: wire this into the forward pass to inject target context
-        into the draft backbone.
+        Uses the input stage's ``main_proj`` + ``main_norm`` (checkpoint
+        ``mtp.0.main_proj`` / ``mtp.0.main_norm``).
         """
-        return self.fc(target_hidden_states)
+        return self.input_layer.project_main_context(target_hidden_states)
 
-    def markov_bias(
-        self, prev_token_ids: torch.Tensor
-    ) -> torch.Tensor:
+    def markov_bias(self, prev_token_ids: torch.Tensor) -> torch.Tensor:
         """Compute Markov transition bias for previous tokens.
 
         B(x_{k-1}, ·) = W₂(W₁[x_{k-1}])   ∈ ℝ^V
@@ -418,10 +395,10 @@ class DSparkInnerModel(nn.Module):
 
     def forward_dspark_block(
         self,
-        draft_input_ids: torch.Tensor,          # [B*γ]
-        draft_positions: torch.Tensor,          # [B*γ]
-        anchor_token_ids: torch.Tensor,         # [B]
-        target_context: torch.Tensor,           # [B, 3 * hidden_size]
+        draft_input_ids: torch.Tensor,  # [B*γ]
+        draft_positions: torch.Tensor,  # [B*γ]
+        anchor_token_ids: torch.Tensor,  # [B]
+        target_context: torch.Tensor,  # [B, 3 * hidden_size]
         temperature: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         """Full DSpark block generation (called within forward context).
@@ -430,55 +407,52 @@ class DSparkInnerModel(nn.Module):
         ``causal=False`` attention metadata before calling this.
 
         This method:
-          1. Projects target context and injects into draft embeddings
-          2. Runs all backbone layers on the flat [B*γ] sequence
+          1. Projects target context via main_proj+main_norm (main_x)
+          2. Embeds draft tokens and runs all stages on the flat [B*γ] seq
           3. Computes base logits via hc_head
           4. Runs Markov sequential sampling
           5. Computes confidence scores
 
         Returns dict with draft_tokens [B,γ], draft_logits [B,γ,V],
         confidence [B,γ].
+
+        NOTE (fix C, pending): in the reference architecture the target
+        context enters *only* through DSparkAttention cross-attention
+        (per-layer ``main_kv`` written into the draft KV cache). That requires
+        speculator/KV-cache changes and is not yet wired. As an INTERIM, the
+        projected ``main_x`` is added to the anchor (position-0) embedding so
+        some context flows; this is an approximation and will be replaced by
+        cross-attention. See dspark/checkpoint_anatomy.md (fix C) and
+        dspark/phase_cd_plan.md.
         """
         B = anchor_token_ids.size(0)
         gamma = self.block_size
-        device = anchor_token_ids.device
 
-        # 1. Project target context: [B, 3*D] → [B, D]
-        ctx = self.fc(target_context)  # [B, hidden_size]
+        # 1. Project target context: [B, 3*D] → [B, D] via main_proj+main_norm.
+        main_x = self.project_context(target_context)  # [B, hidden_size]
 
-        # 2. Embed draft tokens: [B*γ, D]
+        # 2. Embed draft tokens: [B*γ, D]. Embeddings feed the blocks directly
+        #    (no enorm/hnorm/e_proj/h_proj — those do not exist in DSpark).
         draft_embeds = self.embed_tokens(draft_input_ids)  # [B*γ, D]
 
-        # 3. Inject context at anchor positions (every γ-th position, offset 0).
-        #    Reshape to [B, γ, D] for easy indexing.
+        # 3. INTERIM context injection (see NOTE / fix C): add main_x to the
+        #    anchor position embedding. Proper path is cross-attention KV.
         embeds_2d = draft_embeds.reshape(B, gamma, -1)  # [B, γ, D]
-        embeds_2d[:, 0, :] = embeds_2d[:, 0, :] + ctx   # inject at position 0
-        flat_embeds = embeds_2d.reshape(B * gamma, -1)   # [B*γ, D]
+        embeds_2d[:, 0, :] = embeds_2d[:, 0, :] + main_x
+        flat_embeds = embeds_2d.reshape(B * gamma, -1)  # [B*γ, D]
 
-        # 4. Run backbone layers with 3D input so the decoder layer's mhc
-        #    encoding produces genuine multi-stream hidden states (hc_mult=4),
-        #    matching what the target model's hc_head expects.
+        # 4. Run all stages with 3D [*, hc_mult, D] input so the decoder
+        #    block's mHC encoding produces genuine multi-stream hidden states
+        #    (hc_mult=4), matching what the hc_head expects.
         output_key = str(self.mtp_start_layer_idx + self.num_mtp_layers - 1)
         output_layer = self.layers[output_key]
         hc_mult = output_layer.hc_mult
-        hidden_states = flat_embeds.reshape(
-            B * gamma, 1, -1
-        ).expand(-1, hc_mult, -1)  # [B*γ, hc_mult, D]
+        hidden_states = flat_embeds.reshape(B * gamma, 1, -1).expand(
+            -1, hc_mult, -1
+        )  # [B*γ, hc_mult, D]
         for layer_key in sorted(self.layers.keys(), key=int):
-            layer = self.layers[layer_key]
-            # Apply per-layer input projections (enorm/hnorm + e_proj/h_proj).
-            # For DSpark block generation there is no separate target hidden
-            # state stream — the same hidden states serve both roles.
-            norm_emb = layer.enorm(hidden_states)
-            norm_hid = layer.hnorm(hidden_states)
-            projected = layer.h_proj(norm_hid) + layer.e_proj(norm_emb)
-            hidden_states, residual, post_mix, res_mix = layer.mtp_block(
-                positions=draft_positions,
-                x=projected,
-                input_ids=None,
-            )
-            hidden_states = mhc_post_tilelang(
-                hidden_states, residual, post_mix, res_mix
+            hidden_states = self.layers[layer_key].run_block(
+                draft_positions, hidden_states
             )
 
         # 5. Compute base logits via hc_head on the output layer.
@@ -513,8 +487,8 @@ class DSparkInnerModel(nn.Module):
         prev = anchor_token_ids.long()  # [B]
 
         for k in range(gamma):
-            prev_emb = self.markov_w1(prev)          # [B, rank]
-            bias = self.markov_w2(prev_emb)           # [B, V]
+            prev_emb = self.markov_w1(prev)  # [B, rank]
+            bias = self.markov_w2(prev_emb)  # [B, V]
             step_logits = base_logits[:, k, :] + bias  # [B, V]
             draft_logits_list.append(step_logits)
 
@@ -525,15 +499,15 @@ class DSparkInnerModel(nn.Module):
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
             draft_tokens_list.append(next_token)
 
-            h_k = hidden_3d[:, k, :]                  # [B, D]
+            h_k = hidden_3d[:, k, :]  # [B, D]
             c_k = self.confidence_score(h_k, prev_emb)  # [B, 1]
             confidence_list.append(c_k.squeeze(-1))
 
             prev = next_token
 
-        draft_tokens = torch.stack(draft_tokens_list, dim=1)   # [B, γ]
-        draft_logits = torch.stack(draft_logits_list, dim=1)   # [B, γ, V]
-        confidence = torch.stack(confidence_list, dim=1)        # [B, γ]
+        draft_tokens = torch.stack(draft_tokens_list, dim=1)  # [B, γ]
+        draft_logits = torch.stack(draft_logits_list, dim=1)  # [B, γ, V]
+        confidence = torch.stack(confidence_list, dim=1)  # [B, γ]
 
         return {
             "draft_tokens": draft_tokens,
@@ -545,13 +519,13 @@ class DSparkInnerModel(nn.Module):
     # Weight loading
     # ═══════════════════════════════════════════════════════════════════
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Weight name remapping for checkpoint compatibility.
+        # Token embedding (top-level ``embed.weight``) and the tied LM head
+        # (top-level ``head.weight``) are shared from the target model in
+        # load_eagle_model, so they are not remapped here. The output stage's
+        # pre-head norm ``mtp.2.norm.weight`` maps to ``shared_head.norm``.
         WEIGHT_NAME_REMAPPING: dict[str, str] = {
-            ".emb.tok_emb.weight": ".embed_tokens.weight",
-            ".head.weight": ".shared_head.head.weight",
             ".norm.weight": ".shared_head.norm.weight",
             # DSpark-specific: checkpoint paths → model parameter paths
             ".markov_head.markov_w1.weight": ".markov_w1.weight",
@@ -562,13 +536,15 @@ class DSparkInnerModel(nn.Module):
         def _remap_weight_name(name: str) -> str:
             for old_pattern, new_pattern in WEIGHT_NAME_REMAPPING.items():
                 if old_pattern in name:
-                    # Guard: .norm.weight matches kv_norm, q_norm,
-                    # attn_norm, ffn_norm — only remap the output norm.
+                    # Guard: .norm.weight also appears as a substring of the
+                    # decoder norms (attn_norm/ffn_norm/kv_norm/q_norm) and the
+                    # input-stage main_norm — only remap the output norm.
                     if old_pattern == ".norm.weight" and (
                         "attn_norm" in name
                         or "ffn_norm" in name
                         or "kv_norm" in name
                         or "q_norm" in name
+                        or "main_norm" in name
                     ):
                         continue
                     name = name.replace(old_pattern, new_pattern)
@@ -717,9 +693,7 @@ class DSparkInnerModel(nn.Module):
 
         loaded_layers: set[int] = set()
         for param_name in loaded_params:
-            spec_layer = get_spec_layer_idx_from_weight_name(
-                self.config, param_name
-            )
+            spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)
             if spec_layer is not None:
                 loaded_layers.add(spec_layer)
         for layer_idx in range(
@@ -765,9 +739,7 @@ class DSparkInnerModel(nn.Module):
             )
 
         self.finalize_mega_moe_weights()
-        logger.info_once(
-            "DSpark draft model loaded: %d params", len(loaded_params)
-        )
+        logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
     def finalize_mega_moe_weights(self) -> None:
@@ -782,10 +754,6 @@ class DSparkInnerModel(nn.Module):
         """
         spec_layer_weight_names = [
             "embed_tokens",
-            "enorm",
-            "hnorm",
-            "h_proj",
-            "e_proj",
             "shared_head",
             "hc_head_fn",
             "hc_head_base",
@@ -794,8 +762,7 @@ class DSparkInnerModel(nn.Module):
             "markov_w1",
             "markov_w2",
             "confidence_proj",
-            "fc",
-            # Per-layer weights outside mtp_block
+            # Per-stage weights outside mtp_block (input stage only)
             "main_norm",
             "main_proj",
         ]
@@ -804,7 +771,6 @@ class DSparkInnerModel(nn.Module):
             "markov_w1",
             "markov_w2",
             "confidence_proj",
-            "fc",
         ]
         spec_layer_weight = False
         shared_weight = False
@@ -821,16 +787,11 @@ class DSparkInnerModel(nn.Module):
                 f"layers.{spec_layer}.mtp_block.",
             )
         elif shared_weight:
-            # Top-level shared weights (embed, Markov, confidence, fc)
-            # live directly on the inner model, not under layers.
+            # Top-level shared weights (embed, Markov, confidence) live
+            # directly on the inner model, not under layers.
             name = name.replace(f"layers.{spec_layer}.", "")
-        else:
-            # Per-layer spec weights (enorm, hnorm, e_proj, h_proj,
-            # shared_head, hc_head_*) live under layers.{idx}.*
-            name = name.replace(
-                f"layers.{spec_layer}.",
-                f"layers.{spec_layer}.",
-            )
+        # else: per-stage spec weights (shared_head, hc_head_*, main_proj,
+        # main_norm) stay under layers.{idx}.* unchanged.
         return name
 
 
@@ -848,9 +809,7 @@ class DeepSeekV4DSparkModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         inner_prefix = maybe_prefix(prefix, "model")
-        self.model = DSparkInnerModel(
-            vllm_config=vllm_config, prefix=inner_prefix
-        )
+        self.model = DSparkInnerModel(vllm_config=vllm_config, prefix=inner_prefix)
         self.config = self.model.config
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -866,8 +825,12 @@ class DeepSeekV4DSparkModel(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         return self.model(
-            input_ids, positions, hidden_states,
-            intermediate_tensors, inputs_embeds, spec_step_idx,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
         )
 
     def compute_logits(
@@ -880,9 +843,7 @@ class DeepSeekV4DSparkModel(nn.Module):
     def forward_dspark_block(self, **kwargs: typing.Any) -> dict[str, torch.Tensor]:
         return self.model.forward_dspark_block(**kwargs)
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return self.model.load_weights(weights)
 
     def finalize_mega_moe_weights(self) -> None:

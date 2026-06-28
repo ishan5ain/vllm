@@ -1,12 +1,13 @@
 # DSpark vLLM Integration — Handoff
 
 > **Date:** 2026-06-28
-> **Status:** 🔧 DEBUGGING — 0% draft acceptance; ROOT CAUSE FOUND via checkpoint
->   verification: the draft model definition does not match the checkpoint layout.
+> **Status:** 🔧 ARCHITECTURE REWIRED to match checkpoint (A/B/D/E/F done,
+>   uncommitted, untested on cluster). Fix C (cross-attention) is INTERIM —
+>   proper version designed in `dspark/phase_cd_plan.md`.
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
-> **Latest commit:** `d4d66dfee` — run backbone with 3D input for proper hc_head
-> **Read first:** `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" section,
->   then `dspark/PROGRESS.md`.
+> **Latest commit:** `d4d66dfee` (code edits below are uncommitted)
+> **Read first:** `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING", then
+>   `dspark/phase_cd_plan.md`, then `dspark/PROGRESS.md`.
 
 ## What This Is
 
@@ -39,11 +40,29 @@ guarantees garbage drafts and 0% acceptance regardless of the hc_head fix:
 See `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" for the exact weight
 list, data flow, and the A–F fix table.
 
-**Guardrail added this session:** `load_weights` now hard-fails listing every
-parameter with no checkpoint source (token embedding + tied head exempted). On
-the current architecture it will raise — that is intentional; it prevents
-serving random weights at a guaranteed 0% acceptance. Loading will succeed once
-fixes A/B/E from the mapping table are done.
+**Guardrail (`load_weights`):** hard-fails listing every parameter with no
+checkpoint source (token embedding + tied head exempted). This now PASSES with
+the rewire below — every draft parameter has a real checkpoint weight.
+
+## Architecture rewire done this session (A/B/D/E/F)
+
+Edits in `vllm/models/deepseek_v4/nvidia/dspark.py` and `.../model.py`
+(uncommitted; lint-clean via ruff; not yet built/tested on cluster):
+
+- **A** — `self.fc` removed; context projection is now `mtp.0.main_proj`
+  (fp8, quant_config) + `mtp.0.main_norm` on the input stage. These load
+  (were previously skipped).
+- **B** — `enorm`/`hnorm`/`e_proj`/`h_proj` removed everywhere; token
+  embeddings feed the decoder blocks directly (matches reference).
+- **D** — target context capture is now `mhc_post`-applied + mean over
+  `hc_mult` (reference `h.mean(dim=2)`), not first-stream pre-`mhc_post`.
+- **E/F** — dead `.emb.tok_emb`/`.head.weight` remaps removed; `mtp.2.norm`
+  → `shared_head.norm`; embedding + LM head shared via `load_eagle_model`
+  (confirmed in eagle/utils.py:67–85).
+- **C (INTERIM)** — `main_x` is added to the anchor embedding. Proper
+  cross-attention (per-stage `main_kv` in the draft KV cache) is designed
+  in `dspark/phase_cd_plan.md` but NOT implemented (needs speculator/KV
+  changes; untestable from here).
 
 9 prior bugs fixed across weight loading, EAGLE3 interface, tensor
 dimensionality, kernel compatibility, and draft correctness.
@@ -100,14 +119,21 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Immediate Next Steps
 
-1. **Fix the architecture mismatch** (A–F in `checkpoint_anatomy.md`). Minimum to
-   reach >0% acceptance: (A) wire `mtp.0.main_proj`+`main_norm` as the context
-   projection and stop skipping them; (B) remove `enorm/hnorm/e_proj/h_proj` and
-   feed embeddings directly; (C) pass `main_x` as cross-attn context to each
-   block; (D) capture target context as mean-over-hc; (E) fix head/norm remaps.
-   The new `load_weights` assertion will tell you when no params are left random.
-2. **Cluster test** — once it loads (assertion passes), measure acceptance.
+1. **Build & cluster-test the rewire (A/B/D/E/F)** — confirm the model loads
+   (the completeness assertion passes), serves, and measure acceptance. With
+   interim C, expect low-but-possibly-nonzero acceptance.
+2. **Implement proper C** (cross-attention) per `dspark/phase_cd_plan.md`
+   (option (a): per-stage one-token main_kv prefill into the draft KV cache).
+   Remove the interim embedding addition. Target >3/5 acceptance.
 3. **Verify Markov head end-to-end** against the reference `forward_head` loop.
 4. **Phase 3b: DSpark CUDA graphs** — build DSparkCudaGraphManager (see `phase3_cudagraph_plan.md`)
 5. **Phase 4: Confidence scheduling** — integrate confidence head
 6. **Phase 5: STS calibration** — calibrate acceptance thresholds
+
+## Risks to watch on first cluster build
+
+- `main_proj` fp8 scale: expects `main_proj.weight_scale_inv` param (created by
+  the fp8 quant method). If quant_config differs, the `.scale` load may need a
+  different suffix.
+- Fix D adds 3 extra `mhc_post_tilelang` calls (layers 40/41/42) per forward.
+- Interim C: acceptance may stay low until proper cross-attention lands.
