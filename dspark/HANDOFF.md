@@ -1,10 +1,10 @@
 # DSpark vLLM Integration — Handoff
 
 > **Date:** 2026-06-28
-> **Status:** ✅ SERVING on 2× DGX Spark GB10 cluster
+> **Status:** 🔧 DEBUGGING — 0% draft acceptance, hc_head fix pending cluster test
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
-> **Read first:** `dspark/PROGRESS.md` — full state, gaps, build/run commands
-> **Latest commit:** `f0b84ed07` — sparse_attn: disable cooperative_topk on Blackwell+
+> **Latest commit:** `d4d66dfee` — run backbone with 3D input for proper hc_head
+> **Read first:** `dspark/PROGRESS.md` — full state, all bugs fixed, gaps
 
 ## What This Is
 
@@ -13,51 +13,54 @@ Integration of DeepSeek's DSpark speculative decoding into vLLM for
 
 ## Current State
 
-**Phases 0–2 complete. Model is serving at ~15 tok/s decode, ~13K tok/s prefill.**
+**Phase 2 (Draft Generation) code complete. DSpark is serving at O1 with PIECEWISE
+CUDA graphs on the main model.** However, draft acceptance is **0% across all 5
+positions** — the hc_head was receiving wrong input (1 stream × 4 identical copies
+instead of 4 genuine mhc-encoded streams). Fix committed in `d4d66dfee`, pending
+cluster test.
 
-All 8+ bugs across weight loading, EAGLE3 interface, tensor dimensionality, and
-kernel compatibility have been resolved. The server accepts `/v1/chat/completions`
-requests and generates tokens with DSpark speculative decoding enabled.
-
-Performance is capped by O0 eager mode (no CUDA graphs, no FlashInfer autotune)
-due to cooperative_topk kernel incompatibility on SM120a (GB10's Blackwell GPU).
-The standard Chthonic b12x + MTP path achieves ~52 tok/s on the same hardware.
+9 bugs fixed across weight loading, EAGLE3 interface, tensor dimensionality,
+kernel compatibility, and draft correctness.
 
 ## Architecture at a Glance
 
 ```
-Target model forward → captures layers 40,41,42 → _dspark_context_buffer
+Target model forward → layers 40,41,42 → _dspark_context_buffer [T, 3×D]
   ↓
 model_runner → DSparkProposer.propose() → DSparkSpeculator
   ↓
-DSparkSpeculator → _prepare_dspark_inputs() → forward_dspark_block()
+DSparkSpeculator → _prepare_dspark_inputs → forward_dspark_block()
   ↓
-forward_dspark_block: fc proj → embed [anchor,mask×4] → backbone(3 layers)
-  → hc_head → Markov W₁W₂ sampling → confidence head
+forward_dspark_block:
+  fc context proj → embed [anchor,noise×4] → 3D expand (hc_mult=4)
+  → backbone(3 layers, mhc encoding) → hc_head (4-stream)
+  → Markov W₁W₂ sampling → confidence head
   ↓
-Return [num_reqs, γ=5] draft tokens
+Return [num_reqs, γ=5] draft tokens + logits + confidence
 ```
 
 ## Key Decisions
 
-- Standard recipe (`vllm-node`, default backends), NOT Chthonic b12x
-- Draft TP=2 (matches target)
-- `DSparkProposer(SpecDecodeBaseProposer)` for model_runner integration
-- `causal=False` in attention metadata (bidirectional within block)
-- CUDA graphs deferred (Phase 3) — O0 eager mode currently
-- cooperative_topk disabled on Blackwell (≥sm_100), falls back to persistent_topk
-- Memory: `gpu_memory_utilization=0.85`, `max_num_seqs=1` on GB10
+- Standard `vllm-node` container (not Chthonic b12x)
+- Draft TP=2, O1 with PIECEWISE CUDA graphs on main model
+- `DSparkProposer(SpecDecodeBaseProposer)` — model_runner integration
+- `causal=False` in draft attention (bidirectional within block)
+- cooperative_topk disabled on Blackwell (≥sm_100), fallback to persistent_topk
+- Memory: `gpu_memory_utilization=0.85`, `max_num_seqs=1`
 
-## Resolved Cluster-Test Issues
+## Resolved Issues
 
-| # | Bug | Fix Commit |
+| # | Bug | Commit |
 |---|---|---|
 | 1 | `model.` prefix mismatch in weight lookups | `0346cbd7b` |
-| 2 | EAGLE3 interface requirement during init | `cbaa4ad2a` |
-| 3 | 2D/3D hidden_state IndexError in context capture | `90ead3aea` |
-| 4 | cooperative_topk crash (warmup + inference) | recipe `-O0` + `f0b84ed07` |
+| 2 | `.norm.weight` / `main_norm` / `attn_sink` weight loading | `f1cdf686f` |
+| 3 | Integration: method routing, model auto-set, proposer chain | pre-cluster |
+| 4 | EAGLE3 interface during init | `cbaa4ad2a` |
+| 5 | 2D/3D hidden_state IndexError | `90ead3aea` |
+| 6 | cooperative_topk crash (warmup + inference) | `f0b84ed07` + O1 recipe |
+| 7 | **0% draft acceptance** — hc_head wrong input | `d4d66dfee` (pending test) |
 
-## Quick Start (Cluster)
+## Quick Start
 
 ```bash
 cd ~/repos/spark-vllm-docker
@@ -71,9 +74,7 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Immediate Next Steps
 
-1. **Benchmark acceptance rate** — is DSpark achieving >4/5 accepted tokens vs MTP's ~2.2/2?
-2. **Verify Markov head** — compare draft token sequences against reference implementation
-3. **Profile overhead** — quantify time in DSpark forward vs target forward
-4. **Phase 3** — re-enable CUDA graphs once cooperative_topk is fixed on SM120a
-5. **Phase 4** — integrate confidence head for adaptive draft truncation
-6. **Phase 5** — STS calibration on held-out set
+1. **Cluster test hc_head fix** — if acceptance >0%, benchmark
+2. **Phase 3b: DSpark CUDA graphs** — build DSparkCudaGraphManager (see `phase3_cudagraph_plan.md`)
+3. **Phase 4: Confidence scheduling** — integrate confidence head
+4. **Phase 5: STS calibration** — calibrate acceptance thresholds
