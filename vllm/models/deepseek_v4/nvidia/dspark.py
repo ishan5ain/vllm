@@ -477,10 +477,13 @@ class DSparkInnerModel(nn.Module):
         # 5. Compute base logits via hc_head on the output layer.
         output_key = str(self.mtp_start_layer_idx + self.num_mtp_layers - 1)
         output_layer = self.layers[output_key]
-        # hc_head expects [T, hc_mult, D] input.
-        hc_input = hidden_states.reshape(-1, 1, self.config.hidden_size).repeat(
-            1, output_layer.hc_mult, 1
-        )  # [B*γ, hc_mult, D]
+        # The backbone runs with hc_mult=1 (2D input), producing a single
+        # stream.  Pass hc_mult=1 to the hc_head kernel — it will use only
+        # the self-channel projection fn[0, 0:D], not the full 4×4 mixing.
+        # The Markov head corrects for the missing cross-channel mixing.
+        hc_input = hidden_states.reshape(
+            -1, 1, self.config.hidden_size
+        )  # [B*γ, 1, D]
         hc_output = hc_head_fused_kernel_tilelang(
             hc_input,
             output_layer.hc_head_fn,
