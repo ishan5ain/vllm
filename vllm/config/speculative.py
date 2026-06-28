@@ -774,6 +774,8 @@ class SpeculativeConfig:
                             "multiple times of forward on same MTP layer"
                             ",which may result in lower acceptance rate"
                         )
+                elif self.draft_model_config.hf_config.model_type == "deepseek_dspark":
+                    self.method = "dspark"
                 elif self.method == "draft_model":
                     pass
                 else:
