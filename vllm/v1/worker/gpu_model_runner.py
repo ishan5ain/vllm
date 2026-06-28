@@ -612,11 +612,14 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
-            else:
-                raise ValueError(
-                    "Unknown speculative decoding method: "
-                    f"{self.speculative_config.method}"
+            elif self.speculative_config.method == "dspark":
+                # DSpark uses a custom proposer that wraps DSparkSpeculator.
+                from vllm.v1.spec_decode.dspark_proposer import DSparkProposer
+
+                self.drafter = DSparkProposer(
+                    vllm_config=self.vllm_config, device=self.device, runner=self
                 )
+                self.use_aux_hidden_state_outputs = True
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
@@ -5008,6 +5011,7 @@ class GPUModelRunner(
             spec_config.use_eagle()
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
+            or spec_config.method == "dspark"
         ):
             assert isinstance(
                 self.drafter,
