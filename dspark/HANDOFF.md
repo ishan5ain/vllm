@@ -1,8 +1,10 @@
 # DSpark vLLM Integration — Handoff
 
 > **Date:** 2026-06-28
+> **Status:** ✅ SERVING on 2× DGX Spark GB10 cluster
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
 > **Read first:** `dspark/PROGRESS.md` — full state, gaps, build/run commands
+> **Latest commit:** `f0b84ed07` — sparse_attn: disable cooperative_topk on Blackwell+
 
 ## What This Is
 
@@ -11,16 +13,15 @@ Integration of DeepSeek's DSpark speculative decoding into vLLM for
 
 ## Current State
 
-**Phases 0–2 code complete. Cluster testing in progress — weight loading
-bugs found and fixed, pending rebuild and verification.**
+**Phases 0–2 complete. Model is serving at ~15 tok/s decode, ~13K tok/s prefill.**
 
-The draft model loads weights from the DSpark checkpoint alongside the
-target model. Integration spans 9 files across the vLLM codebase (config,
-registry, model, speculator, proposer, model_runner).
+All 8+ bugs across weight loading, EAGLE3 interface, tensor dimensionality, and
+kernel compatibility have been resolved. The server accepts `/v1/chat/completions`
+requests and generates tokens with DSpark speculative decoding enabled.
 
-Weight loading was the primary cluster-testing challenge — multiple
-naming and remapping bugs required iterative fixes. The latest fix
-(guard placement + attn_sink handler) is pending rebuild.
+Performance is capped by O0 eager mode (no CUDA graphs, no FlashInfer autotune)
+due to cooperative_topk kernel incompatibility on SM120a (GB10's Blackwell GPU).
+The standard Chthonic b12x + MTP path achieves ~52 tok/s on the same hardware.
 
 ## Architecture at a Glance
 
@@ -43,7 +44,18 @@ Return [num_reqs, γ=5] draft tokens
 - Draft TP=2 (matches target)
 - `DSparkProposer(SpecDecodeBaseProposer)` for model_runner integration
 - `causal=False` in attention metadata (bidirectional within block)
-- CUDA graphs deferred to Phase 3
+- CUDA graphs deferred (Phase 3) — O0 eager mode currently
+- cooperative_topk disabled on Blackwell (≥sm_100), falls back to persistent_topk
+- Memory: `gpu_memory_utilization=0.85`, `max_num_seqs=1` on GB10
+
+## Resolved Cluster-Test Issues
+
+| # | Bug | Fix Commit |
+|---|---|---|
+| 1 | `model.` prefix mismatch in weight lookups | `0346cbd7b` |
+| 2 | EAGLE3 interface requirement during init | `cbaa4ad2a` |
+| 3 | 2D/3D hidden_state IndexError in context capture | `90ead3aea` |
+| 4 | cooperative_topk crash (warmup + inference) | recipe `-O0` + `f0b84ed07` |
 
 ## Quick Start (Cluster)
 
@@ -56,3 +68,12 @@ docker tag vllm-node:latest vllm-node:dspark
 ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 ./run-recipe.sh deepseek-v4-flash-dspark --no-ray
 ```
+
+## Immediate Next Steps
+
+1. **Benchmark acceptance rate** — is DSpark achieving >4/5 accepted tokens vs MTP's ~2.2/2?
+2. **Verify Markov head** — compare draft token sequences against reference implementation
+3. **Profile overhead** — quantify time in DSpark forward vs target forward
+4. **Phase 3** — re-enable CUDA graphs once cooperative_topk is fixed on SM120a
+5. **Phase 4** — integrate confidence head for adaptive draft truncation
+6. **Phase 5** — STS calibration on held-out set
