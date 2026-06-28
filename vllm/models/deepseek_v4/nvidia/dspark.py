@@ -204,18 +204,12 @@ class DeepSeekV4DSparkLayer(nn.Module):
         return hidden_states
 
 
-class DeepSeekV4DSparkModel(nn.Module):
-    """DSpark speculative decoding draft model for DeepSeek V4.
+class DSparkInnerModel(nn.Module):
+    """DSpark inner draft model — holds layers, heads, and weight loading.
 
-    Loads the DSpark checkpoint weights (3 MTP layers + Markov head +
-    confidence head) from ``deepseek-ai/DeepSeek-V4-Flash-DSpark``.
-
-    Design notes:
-    - Draft model runs with TP=2 (matches target TP=2).
-    - Markov head W₁ uses VocabParallelEmbedding (vocab split across TP).
-    - Markov head W₂ uses ColumnParallelLinear (output vocab split).
-    - Confidence head and fc use ReplicatedLinear (small, replicated on all ranks).
-    - Reuses ``MTPSpeculator`` for spec decode integration.
+    This is the actual model that contains all DSpark parameters.
+    Wrapped by ``DeepSeekV4DSparkModel`` for vLLM compatibility
+    (``load_eagle_model`` expects a ``.model`` attribute).
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -239,6 +233,8 @@ class DeepSeekV4DSparkModel(nn.Module):
                 self.num_mtp_layers,
             )
             self.num_mtp_layers = 3
+        # Write back so get_spec_layer_idx_from_weight_name finds all 3 layers.
+        config.num_nextn_predict_layers = self.num_mtp_layers
 
         topk_tokens = config.index_topk
         self.topk_indices_buffer = torch.empty(
@@ -459,13 +455,19 @@ class DeepSeekV4DSparkModel(nn.Module):
         embeds_3d[:, 0, :] = embeds_3d[:, 0, :] + ctx    # inject at position 0
         draft_embeds = embeds_3d.reshape(B * gamma, -1)  # [B*γ, D]
 
-        # 4. Run backbone layers.
+        # 4. Run backbone layers with per-layer input projections.
         hidden_states = draft_embeds
         for layer_key in sorted(self.layers.keys(), key=int):
             layer = self.layers[layer_key]
+            # Apply per-layer input projections (enorm/hnorm + e_proj/h_proj).
+            # For DSpark block generation there is no separate target hidden
+            # state stream — the same hidden states serve both roles.
+            norm_emb = layer.enorm(hidden_states)
+            norm_hid = layer.hnorm(hidden_states)
+            projected = layer.h_proj(norm_hid) + layer.e_proj(norm_emb)
             hidden_states, residual, post_mix, res_mix = layer.mtp_block(
                 positions=draft_positions,
-                x=hidden_states,
+                x=projected,
                 input_ids=None,
             )
             hidden_states = mhc_post_tilelang(
@@ -743,7 +745,13 @@ class DeepSeekV4DSparkModel(nn.Module):
             "confidence_proj",
             "fc",
         ]
-        shared_weight_names = ["embed_tokens"]
+        shared_weight_names = [
+            "embed_tokens",
+            "markov_w1",
+            "markov_w2",
+            "confidence_proj",
+            "fc",
+        ]
         spec_layer_weight = False
         shared_weight = False
         for weight_name in spec_layer_weight_names:
@@ -753,10 +761,113 @@ class DeepSeekV4DSparkModel(nn.Module):
                     shared_weight = True
                 break
         if not spec_layer_weight:
+            # Decoder-block weights go under layers.{idx}.mtp_block.*
             name = name.replace(
                 f"model.layers.{spec_layer}.",
-                f"model.layers.{spec_layer}.mtp_block.",
+                f"layers.{spec_layer}.mtp_block.",
             )
         elif shared_weight:
-            name = name.replace(f"model.layers.{spec_layer}.", "model.")
+            # Top-level shared weights (embed, Markov, confidence, fc)
+            # live directly on the inner model, not under layers.
+            name = name.replace(f"model.layers.{spec_layer}.", "")
+        else:
+            # Per-layer spec weights (enorm, hnorm, e_proj, h_proj,
+            # shared_head, hc_head_*) live under layers.{idx}.*
+            name = name.replace(
+                f"model.layers.{spec_layer}.",
+                f"layers.{spec_layer}.",
+            )
         return name
+
+
+class DeepSeekV4DSparkModel(nn.Module):
+    """DSpark speculative decoding draft model — vLLM wrapper.
+
+    Thin wrapper around ``DSparkInnerModel`` for vLLM compatibility.
+    ``load_eagle_model()`` expects a ``.model`` attribute pointing to
+    the inner model (for embedding sharing and topk_indices_buffer).
+
+    Delegates forward, compute_logits, and weight loading to the
+    inner model.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        inner_prefix = maybe_prefix(prefix, "model")
+        self.model = DSparkInnerModel(
+            vllm_config=vllm_config, prefix=inner_prefix
+        )
+        self.config = self.model.config
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.model(
+            input_ids, positions, hidden_states,
+            intermediate_tensors, inputs_embeds, spec_step_idx,
+        )
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | None:
+        return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def forward_dspark_block(self, **kwargs: typing.Any) -> dict[str, torch.Tensor]:
+        return self.model.forward_dspark_block(**kwargs)
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        return self.model.load_weights(weights)
+
+    def finalize_mega_moe_weights(self) -> None:
+        self.model.finalize_mega_moe_weights()
+
+    # ── Accessors needed by load_eagle_model ─────────────────────────
+
+    @property
+    def block_size(self) -> int:
+        return self.model.block_size
+
+    @property
+    def noise_token_id(self) -> int:
+        return self.model.noise_token_id
+
+    @property
+    def layers(self) -> nn.ModuleDict:
+        return self.model.layers
+
+    @property
+    def topk_indices_buffer(self) -> torch.Tensor:
+        return self.model.topk_indices_buffer
+
+    @topk_indices_buffer.setter
+    def topk_indices_buffer(self, value: torch.Tensor) -> None:
+        self.model.topk_indices_buffer = value
+
+    @property
+    def embed_tokens(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    @embed_tokens.setter
+    def embed_tokens(self, value: nn.Module) -> None:
+        self.model.embed_tokens = value
+
+    @property
+    def mtp_start_layer_idx(self) -> int:
+        return self.model.mtp_start_layer_idx
+
+    @property
+    def num_mtp_layers(self) -> int:
+        return self.model.num_mtp_layers

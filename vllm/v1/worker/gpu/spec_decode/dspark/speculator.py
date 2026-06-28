@@ -327,9 +327,10 @@ class DSparkSpeculator(DraftModelSpeculator):
         )
 
         # 2. Get DSpark context (target layers 40, 41, 42 concatenated).
+        target_context_all = None
         if aux_hidden_states is not None and len(aux_hidden_states) > 0:
             target_context_all = aux_hidden_states[0]  # [T, 3*D]
-        else:
+        if target_context_all is None:
             target_model = getattr(self, "_target_model", None)
             if target_model is not None and hasattr(
                 target_model, "get_dspark_context_hidden_states"
@@ -337,10 +338,17 @@ class DSparkSpeculator(DraftModelSpeculator):
                 ctx_buf = target_model.get_dspark_context_hidden_states()
                 if ctx_buf is not None:
                     target_context_all = ctx_buf
-                else:
-                    target_context_all = last_hidden_states
-            else:
-                target_context_all = last_hidden_states
+        if target_context_all is None:
+            # No DSpark context available — return empty draft tokens.
+            # This should not happen in normal operation; the target model
+            # always runs forward() before the speculator is called.
+            logger.warning_once(
+                "DSpark speculator: no target context available. "
+                "Returning empty draft tokens."
+            )
+            return torch.zeros(
+                self.max_num_reqs, gamma, dtype=torch.int64, device=self.device
+            )
 
         # Slice context at anchor positions.
         anchor_context = target_context_all[anchor_indices]  # [B, 3*D]

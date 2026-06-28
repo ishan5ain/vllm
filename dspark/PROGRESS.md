@@ -1,7 +1,7 @@
 # DSpark vLLM Integration — Progress & State
 
 > **Date:** 2026-06-27
-> **Session 2:** Implementation (phases 0–2)
+> **Session 2:** Implementation (phases 0–2) + correctness review + bug fixes
 > **Branch:** `dspark-research`
 
 ## Implementation Status
@@ -9,7 +9,7 @@
 ```
 Phase 0: Prerequisites    ████████████ DONE
 Phase 1: Model Loading    ████████████ DONE
-Phase 2: Draft Generation ████████████ DONE (code complete, untested)
+Phase 2: Draft Generation ████████████ DONE (code complete, reviewed, 5 blockers fixed)
 Phase 3: CUDA Graphs      ░░░░░░░░░░░░ DEFERRED
 Phase 4: Scheduling       ░░░░░░░░░░░░ NOT STARTED
 Phase 5: STS Calibration  ░░░░░░░░░░░░ CODE EXISTS, NOT INTEGRATED
@@ -23,11 +23,12 @@ Phase 5: STS Calibration  ░░░░░░░░░░░░ CODE EXISTS, NOT 
 - **Line 1090**: DSpark context stash (before hc_head collapse)
 - **Line 1398**: `get_dspark_context_hidden_states()` exposed on both `DeepseekV4Model` and `DeepseekV4ForCausalLM`
 
-### vllm/models/deepseek_v4/nvidia/dspark.py — DSpark draft model (762 lines)
-- `DeepSeekV4DSparkLayer`: Single backbone layer (enorm/hnorm + e_proj/h_proj + mtp_block). Output layer has hc_head + shared_head.
-- `DeepSeekV4DSparkModel`: Full model with 3 backbone layers, Markov head (W₁: VocabParallelEmbedding, W₂: ColumnParallelLinear), confidence head (ReplicatedLinear[4352→1]), context projection fc (ReplicatedLinear[12288→4096]).
-- `forward_dspark_block()`: Full DSpark cycle — context projection, draft embedding, backbone loop, hc_head logits, Markov sequential sampling, confidence computation. **Must be called within `set_forward_context` with `causal=False`.**
-- `load_weights()`: Full weight loading from checkpoint (3 MTP layers + markov + confidence heads), follows the exact pattern from `mtp.py`.
+### vllm/models/deepseek_v4/nvidia/dspark.py — DSpark draft model (873 lines)
+- `DeepSeekV4DSparkLayer`: Per-layer backbone (enorm/hnorm + e_proj/h_proj + mtp_block). Output layer has hc_head + shared_head.
+- `DSparkInnerModel`: All logic — 3 backbone layers, Markov head (W₁: VocabParallelEmbedding, W₂: ColumnParallelLinear), confidence head (ReplicatedLinear[4352→1]), context projection fc (ReplicatedLinear[12288→4096]).
+- `DeepSeekV4DSparkModel`: Thin wrapper for vLLM compatibility. Exposes `self.model` for `load_eagle_model()` (embedding sharing, topk_indices_buffer). Delegates forward/compute_logits/load_weights.
+- `forward_dspark_block()`: Full DSpark cycle — context projection, draft embedding, per-layer input projections (enorm/hnorm + e_proj/h_proj), backbone loop, hc_head logits, Markov sequential sampling, confidence computation.
+- `load_weights()`: Full weight loading (3 MTP layers + markov + confidence heads). `_rewrite_spec_layer_name()` correctly maps checkpoint paths to `layers.X.*` params. DSpark-specific weights (markov_w1/w2, confidence_proj, fc) are treated as shared top-level weights.
 - Step-by-step `forward()` / `compute_logits()`: Backward-compatible with MTP calling pattern.
 
 ### vllm/v1/worker/gpu/spec_decode/dspark/speculator.py — DSpark speculator (398 lines)
@@ -94,17 +95,25 @@ DSparkSpeculator.propose()
 Return [num_reqs, γ] draft tokens
 ```
 
-## Known Gaps (before cluster test)
+## Known Gaps (after review & fixes)
 
-| # | Gap | Severity | Mitigation |
+| # | Gap | Severity | Status |
 |---|---|---|---|
-| 1 | FlashInfer non-causal on SM121 unverified | Low | FlashInfer supports non-causal; used by DFlash/Eagle already. Test at cluster time. |
-| 2 | Draft KV cache group allocation | Medium | `set_attn()` is wired; verify draft layers get a group at runtime. |
-| 3 | Markov head TP=2 correctness | Medium | `VocabParallelEmbedding` + `ColumnParallelLinear` follow vLLM patterns; verify at cluster time. |
-| 4 | Model calling path: `forward()` vs `forward_dspark_block()` | Medium | Speculator calls `forward_dspark_block()` directly. If something calls `forward()` instead, DSpark logic is bypassed. |
-| 5 | `compute_logits()` called on non-output layer | Low | Guarded with `hasattr(mtp_layer, "hc_head_fn")`. |
-| 6 | No CUDA graphs | Low (deferred) | Eager mode works; ~5-12 min cold boot on SM121. Add CUDA graphs in Phase 3. |
-| 7 | SMP: `num_speculative_tokens=5` vs current recipe's `2` | Low | Just a config change in the recipe JSON. |
+| 1 | FlashInfer non-causal on SM121 unverified | Low | Deferred to cluster test |
+| 2 | Draft KV cache group allocation | Medium | `set_attn()` wired; verify at runtime |
+| 3 | Markov head TP=2 correctness | Medium | TP-aware layers follow vLLM patterns; verify at runtime |
+| 4 | `fc` weight has no confirmed checkpoint source | Medium | May stay randomly initialized — verify checkpoint key at cluster test |
+| 5 | No CUDA graphs | Low | Deferred to Phase 3 |
+| 6 | Auto-detection won't set `method="dspark"` | Low | User must pass explicit `method: "dspark"` in spec config |
+
+## Review History
+
+**2026-06-27 — Correctness review:** Found 5 BLOCKERs, 4 WARNINGs, 2 NITs.
+All blockers fixed (see `dspark/review-correctness.md`).
+
+**2026-06-27 — Integration review:** Found 0 BLOCKERs, 2 WARNINGs.
+Config override, registry, routing, and model_runner plumbing confirmed correct
+(see `dspark/review-integration.md`).
 
 ## Next Steps (Priority Order)
 
@@ -144,11 +153,11 @@ vllm/config/speculative.py                 (+18/-5)  DSpark detection, method ro
 vllm/model_executor/models/registry.py     (+1)      Model registration
 vllm/models/deepseek_v4/__init__.py        (+2)      Re-export
 vllm/models/deepseek_v4/nvidia/model.py    (+46/-3)  Context capture
-vllm/models/deepseek_v4/nvidia/dspark.py   (NEW, 762)  Draft model
+vllm/models/deepseek_v4/nvidia/dspark.py   (NEW, 873)  Draft model (3 classes)
 vllm/v1/worker/gpu/model_runner.py         (+18/-2)  Context plumbing
 vllm/v1/worker/gpu/spec_decode/__init__.py (+6)      Speculator routing
 vllm/v1/worker/gpu/spec_decode/dspark/__init__.py     (NEW)
-vllm/v1/worker/gpu/spec_decode/dspark/speculator.py   (NEW, 398)
+vllm/v1/worker/gpu/spec_decode/dspark/speculator.py   (NEW, 406)
 ```
 
 ## dspark/ Documentation
