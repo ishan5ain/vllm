@@ -706,6 +706,12 @@ class DSparkInnerModel(nn.Module):
             )
             if spec_layer is not None:
                 loaded_layers.add(spec_layer)
+        logger.info_once(
+            "DSpark draft model: config.num_nextn_predict_layers=%d, "
+            "loaded_layers=%s",
+            self.config.num_nextn_predict_layers,
+            sorted(loaded_layers),
+        )
         for layer_idx in range(
             self.mtp_start_layer_idx,
             self.mtp_start_layer_idx + self.num_mtp_layers,
@@ -713,8 +719,10 @@ class DSparkInnerModel(nn.Module):
             if layer_idx not in loaded_layers:
                 raise ValueError(
                     f"DSpark draft layer {layer_idx} weights "
-                    f"missing from checkpoint. The checkpoint may have "
-                    f"been quantized without including the DSpark layers. "
+                    f"missing from checkpoint (loaded={sorted(loaded_layers)}, "
+                    f"n_predict={self.config.num_nextn_predict_layers}). "
+                    f"The checkpoint may have been quantized without "
+                    f"including the DSpark layers. "
                     f"Use a checkpoint that includes DSpark layer weights, "
                     f"or disable speculative decoding."
                 )
