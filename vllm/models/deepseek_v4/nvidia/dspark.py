@@ -620,7 +620,7 @@ class DSparkInnerModel(nn.Module):
             mtp_layer_idx = _find_mtp_layer_idx(name)
             name = name.replace(
                 f"mtp.{mtp_layer_idx}.",
-                f"model.layers.{self.config.num_hidden_layers + mtp_layer_idx}.",
+                f"layers.{self.config.num_hidden_layers + mtp_layer_idx}.",
             )
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
@@ -630,7 +630,7 @@ class DSparkInnerModel(nn.Module):
             name = _remap_weight_name(name)
             name = self._rewrite_spec_layer_name(spec_layer, name)
 
-            if spec_layer != self.mtp_start_layer_idx and ".layers" not in name:
+            if spec_layer != self.mtp_start_layer_idx and "layers." not in name:
                 continue
             if name.endswith(".scale"):
                 suffix = (
@@ -784,19 +784,19 @@ class DSparkInnerModel(nn.Module):
         if not spec_layer_weight:
             # Decoder-block weights go under layers.{idx}.mtp_block.*
             name = name.replace(
-                f"model.layers.{spec_layer}.",
-                f"model.layers.{spec_layer}.mtp_block.",
+                f"layers.{spec_layer}.",
+                f"layers.{spec_layer}.mtp_block.",
             )
         elif shared_weight:
             # Top-level shared weights (embed, Markov, confidence, fc)
             # live directly on the inner model, not under layers.
-            name = name.replace(f"model.layers.{spec_layer}.", "")
+            name = name.replace(f"layers.{spec_layer}.", "")
         else:
             # Per-layer spec weights (enorm, hnorm, e_proj, h_proj,
             # shared_head, hc_head_*) live under layers.{idx}.*
             name = name.replace(
-                f"model.layers.{spec_layer}.",
-                f"model.layers.{spec_layer}.",
+                f"layers.{spec_layer}.",
+                f"layers.{spec_layer}.",
             )
         return name
 
