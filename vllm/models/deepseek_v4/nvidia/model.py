@@ -1098,9 +1098,14 @@ class DeepseekV4Model(nn.Module):
                 global_idx in dspark_target_layers
                 and self._dspark_context_buffer is not None
             ):
-                dspark_context_parts.append(
-                    hidden_states[:, 0, :]  # [T, hidden_size]
+                # hidden_states may be 2D [T, D] or 3D [T, hc_mult, D];
+                # select the first stream when 3D, use as-is when 2D.
+                single_stream = (
+                    hidden_states[:, 0, :]
+                    if hidden_states.dim() == 3
+                    else hidden_states
                 )
+                dspark_context_parts.append(single_stream)
         if layer is not None:
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix
