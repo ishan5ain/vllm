@@ -651,6 +651,11 @@ class DSparkInnerModel(nn.Module):
                 loaded_params.add(name)
                 break
             else:
+                if name not in params_dict:
+                    # Some DSpark checkpoint weights (e.g., main_norm,
+                    # main_proj from the MTP architecture) may not have
+                    # corresponding parameters in the DSpark model.
+                    continue
                 if ".experts." in name:
                     if (
                         "weight_scale" in name
@@ -680,17 +685,14 @@ class DSparkInnerModel(nn.Module):
                             break
                     continue
                 elif "attn_sink" in name:
+                    if name not in params_dict:
+                        continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
-                    if name not in params_dict:
-                        # Some DSpark checkpoint weights (e.g., main_norm,
-                        # main_proj from the MTP architecture) may not have
-                        # corresponding parameters in the DSpark model.
-                        continue
                     if ".shared_experts.w2" in name:
                         name = name.replace(
                             ".shared_experts.w2", ".shared_experts.down_proj"
