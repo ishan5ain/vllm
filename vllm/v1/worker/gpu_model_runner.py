@@ -617,7 +617,6 @@ class GPUModelRunner(
                 self.drafter = DSparkProposer(
                     vllm_config=self.vllm_config, device=self.device, runner=self
                 )
-                self.use_aux_hidden_state_outputs = True
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
