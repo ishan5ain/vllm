@@ -706,7 +706,7 @@ class DSparkInnerModel(nn.Module):
             )
             if spec_layer is not None:
                 loaded_layers.add(spec_layer)
-        logger.info_once(
+        logger.info(
             "DSpark draft model: config.num_nextn_predict_layers=%d, "
             "loaded_layers=%s",
             self.config.num_nextn_predict_layers,
