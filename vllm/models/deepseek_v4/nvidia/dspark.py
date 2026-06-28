@@ -451,12 +451,19 @@ class DSparkInnerModel(nn.Module):
 
         # 3. Inject context at anchor positions (every γ-th position, offset 0).
         #    Reshape to [B, γ, D] for easy indexing.
-        embeds_3d = draft_embeds.reshape(B, gamma, -1)  # [B, γ, D]
-        embeds_3d[:, 0, :] = embeds_3d[:, 0, :] + ctx    # inject at position 0
-        draft_embeds = embeds_3d.reshape(B * gamma, -1)  # [B*γ, D]
+        embeds_2d = draft_embeds.reshape(B, gamma, -1)  # [B, γ, D]
+        embeds_2d[:, 0, :] = embeds_2d[:, 0, :] + ctx   # inject at position 0
+        flat_embeds = embeds_2d.reshape(B * gamma, -1)   # [B*γ, D]
 
-        # 4. Run backbone layers with per-layer input projections.
-        hidden_states = draft_embeds
+        # 4. Run backbone layers with 3D input so the decoder layer's mhc
+        #    encoding produces genuine multi-stream hidden states (hc_mult=4),
+        #    matching what the target model's hc_head expects.
+        output_key = str(self.mtp_start_layer_idx + self.num_mtp_layers - 1)
+        output_layer = self.layers[output_key]
+        hc_mult = output_layer.hc_mult
+        hidden_states = flat_embeds.reshape(
+            B * gamma, 1, -1
+        ).expand(-1, hc_mult, -1)  # [B*γ, hc_mult, D]
         for layer_key in sorted(self.layers.keys(), key=int):
             layer = self.layers[layer_key]
             # Apply per-layer input projections (enorm/hnorm + e_proj/h_proj).
@@ -475,17 +482,9 @@ class DSparkInnerModel(nn.Module):
             )
 
         # 5. Compute base logits via hc_head on the output layer.
-        output_key = str(self.mtp_start_layer_idx + self.num_mtp_layers - 1)
-        output_layer = self.layers[output_key]
-        # The backbone runs with hc_mult=1 (2D input), producing a single
-        # stream.  Pass hc_mult=1 to the hc_head kernel — it will use only
-        # the self-channel projection fn[0, 0:D], not the full 4×4 mixing.
-        # The Markov head corrects for the missing cross-channel mixing.
-        hc_input = hidden_states.reshape(
-            -1, 1, self.config.hidden_size
-        )  # [B*γ, 1, D]
+        #    hidden_states is already [B*γ, hc_mult, D] from the backbone.
         hc_output = hc_head_fused_kernel_tilelang(
-            hc_input,
+            hidden_states,
             output_layer.hc_head_fn,
             output_layer.hc_head_scale,
             output_layer.hc_head_base,
@@ -501,8 +500,11 @@ class DSparkInnerModel(nn.Module):
             output_layer.shared_head.head, hc_output
         ).reshape(B, gamma, -1)  # [B, γ, V]
 
-        # Reshape hidden states for Markov/confidence: [B, γ, D]
-        hidden_3d = hidden_states.reshape(B, gamma, -1)
+        # Reshape hidden states for Markov/confidence — take first stream
+        # from the mhc-encoded backbone output.
+        hidden_3d = hidden_states.reshape(B, gamma, hc_mult, self.config.hidden_size)[
+            :, :, 0, :
+        ]  # [B, γ, D]
 
         # 6. Markov sequential sampling.
         draft_tokens_list = []
