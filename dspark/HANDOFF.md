@@ -1,10 +1,12 @@
 # DSpark vLLM Integration — Handoff
 
 > **Date:** 2026-06-28
-> **Status:** 🔧 DEBUGGING — 0% draft acceptance, hc_head fix pending cluster test
+> **Status:** 🔧 DEBUGGING — 0% draft acceptance; ROOT CAUSE FOUND via checkpoint
+>   verification: the draft model definition does not match the checkpoint layout.
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
 > **Latest commit:** `d4d66dfee` — run backbone with 3D input for proper hc_head
-> **Read first:** `dspark/PROGRESS.md` — full state, all bugs fixed, gaps
+> **Read first:** `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" section,
+>   then `dspark/PROGRESS.md`.
 
 ## What This Is
 
@@ -13,14 +15,38 @@ Integration of DeepSeek's DSpark speculative decoding into vLLM for
 
 ## Current State
 
-**Phase 2 (Draft Generation) code complete. DSpark is serving at O1 with PIECEWISE
-CUDA graphs on the main model.** However, draft acceptance is **0% across all 5
-positions** — the hc_head was receiving wrong input (1 stream × 4 identical copies
-instead of 4 genuine mhc-encoded streams). Fix committed in `d4d66dfee`, pending
-cluster test.
+**Phase 2 code runs end-to-end and serves at O1 with PIECEWISE CUDA graphs, but
+draft acceptance is 0% across all 5 positions.** The hc_head 2D→3D fix
+(`d4d66dfee`) was necessary but is **not** sufficient.
 
-9 bugs fixed across weight loading, EAGLE3 interface, tensor dimensionality,
-kernel compatibility, and draft correctness.
+**Root cause (verified 2026-06-28 against the local HF checkpoint + DeepSeek's
+shipped `inference/model.py`):** the vLLM draft model invents weights that do
+not exist in the checkpoint and leaves them randomly initialized — which
+guarantees garbage drafts and 0% acceptance regardless of the hc_head fix:
+
+- `self.fc` (context projection) has **no checkpoint source**. The real context
+  projection is `mtp.0.main_proj` + `mtp.0.main_norm` — which `load_weights`
+  currently **skips**.
+- `enorm` / `hnorm` / `e_proj` / `h_proj` (per-layer input projections) **do not
+  exist** in DSpark at all. The reference feeds token embeddings directly into
+  the blocks; context enters via cross-attention (`DSparkAttention` takes
+  `main_x`), not via an MTP-style embed/hidden merge.
+- Head/norm remaps point at a non-existent `shared_head`. The draft shares the
+  top-level `head.weight` and uses `mtp.2.norm.weight` as its pre-head norm.
+- Target-context capture uses `hidden[:, 0, :]` (first hc stream); the reference
+  uses the **mean over hc_mult streams** (`h.mean(dim=2)`).
+
+See `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" for the exact weight
+list, data flow, and the A–F fix table.
+
+**Guardrail added this session:** `load_weights` now hard-fails listing every
+parameter with no checkpoint source (token embedding + tied head exempted). On
+the current architecture it will raise — that is intentional; it prevents
+serving random weights at a guaranteed 0% acceptance. Loading will succeed once
+fixes A/B/E from the mapping table are done.
+
+9 prior bugs fixed across weight loading, EAGLE3 interface, tensor
+dimensionality, kernel compatibility, and draft correctness.
 
 ## Architecture at a Glance
 
@@ -74,7 +100,14 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Immediate Next Steps
 
-1. **Cluster test hc_head fix** — if acceptance >0%, benchmark
-2. **Phase 3b: DSpark CUDA graphs** — build DSparkCudaGraphManager (see `phase3_cudagraph_plan.md`)
-3. **Phase 4: Confidence scheduling** — integrate confidence head
-4. **Phase 5: STS calibration** — calibrate acceptance thresholds
+1. **Fix the architecture mismatch** (A–F in `checkpoint_anatomy.md`). Minimum to
+   reach >0% acceptance: (A) wire `mtp.0.main_proj`+`main_norm` as the context
+   projection and stop skipping them; (B) remove `enorm/hnorm/e_proj/h_proj` and
+   feed embeddings directly; (C) pass `main_x` as cross-attn context to each
+   block; (D) capture target context as mean-over-hc; (E) fix head/norm remaps.
+   The new `load_weights` assertion will tell you when no params are left random.
+2. **Cluster test** — once it loads (assertion passes), measure acceptance.
+3. **Verify Markov head end-to-end** against the reference `forward_head` loop.
+4. **Phase 3b: DSpark CUDA graphs** — build DSparkCudaGraphManager (see `phase3_cudagraph_plan.md`)
+5. **Phase 4: Confidence scheduling** — integrate confidence head
+6. **Phase 5: STS calibration** — calibrate acceptance thresholds

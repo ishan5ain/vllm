@@ -736,6 +736,34 @@ class DSparkInnerModel(nn.Module):
                     f"Use a checkpoint that includes DSpark layer weights, "
                     f"or disable speculative decoding."
                 )
+        # Completeness check: every model parameter MUST receive a
+        # checkpoint weight. A parameter left out here keeps its random
+        # initialization and silently corrupts the draft — this is the
+        # root cause of the observed 0% acceptance (the context projection
+        # and any fabricated input projections never get real weights).
+        # Token embedding and the tied LM head are intentionally shared
+        # from the target model (wired in load_eagle_model after this
+        # call), so they are exempt.
+        externally_shared = ("embed_tokens", "shared_head.head")
+        unloaded = sorted(
+            pname
+            for pname in params_dict
+            if pname not in loaded_params
+            and not any(s in pname for s in externally_shared)
+        )
+        if unloaded:
+            raise ValueError(
+                "DSpark draft model has parameters with no checkpoint "
+                "source; they would remain randomly initialized and "
+                "produce ~0% draft acceptance. "
+                f"{len(unloaded)} unloaded parameter(s): {unloaded}. "
+                "This means the model definition does not match the "
+                "checkpoint layout. See dspark/checkpoint_anatomy.md for "
+                "the authoritative weight mapping (e.g. the context "
+                "projection is mtp.0.main_proj + mtp.0.main_norm, not a "
+                "separate `fc`; DSpark has no enorm/hnorm/e_proj/h_proj)."
+            )
+
         self.finalize_mega_moe_weights()
         logger.info_once(
             "DSpark draft model loaded: %d params", len(loaded_params)
