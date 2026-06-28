@@ -677,6 +677,11 @@ class DSparkInnerModel(nn.Module):
                     loaded_params.add(name)
                     continue
                 else:
+                    if name not in params_dict:
+                        # Some DSpark checkpoint weights (e.g., main_norm,
+                        # main_proj from the MTP architecture) may not have
+                        # corresponding parameters in the DSpark model.
+                        continue
                     if ".shared_experts.w2" in name:
                         name = name.replace(
                             ".shared_experts.w2", ".shared_experts.down_proj"
@@ -744,6 +749,9 @@ class DSparkInnerModel(nn.Module):
             "markov_w2",
             "confidence_proj",
             "fc",
+            # Per-layer weights outside mtp_block
+            "main_norm",
+            "main_proj",
         ]
         shared_weight_names = [
             "embed_tokens",
