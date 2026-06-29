@@ -36,6 +36,8 @@ logger = init_logger(__name__)
 # Env-gated diagnostics (DSPARK_DEBUG=1) for the 0%-acceptance investigation.
 _DSPARK_DEBUG = os.environ.get("DSPARK_DEBUG", "0") == "1"
 _DSPARK_DEBUG_CALLS = int(os.environ.get("DSPARK_DEBUG_CALLS", "3"))
+# File sink: vLLM is often launched on a pty not captured by `docker logs`.
+_DSPARK_DEBUG_FILE = os.environ.get("DSPARK_DEBUG_FILE", "/tmp/dspark_debug.log")
 _dspark_dbg_count = 0
 
 
@@ -45,6 +47,15 @@ def _dspark_dbg_should_log() -> bool:
         return False
     _dspark_dbg_count += 1
     return True
+
+
+def _dspark_dbg_emit(msg: str) -> None:
+    logger.info("%s", msg)
+    try:
+        with open(_DSPARK_DEBUG_FILE, "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 
 class DSparkSpeculator(DraftModelSpeculator):
@@ -398,19 +409,15 @@ class DSparkSpeculator(DraftModelSpeculator):
         if _dspark_dbg_should_log():
             with torch.no_grad():
                 ctx = anchor_context.float()
-                logger.info(
-                    "DSPARK_DEBUG propose: num_reqs=%d gamma=%d "
-                    "anchor_tokens=%s anchor_positions=%s anchor_indices=%s "
-                    "ctx_shape=%s ctx_norm=%.3f ctx_nan=%s draft_tokens[0]=%s",
-                    num_reqs,
-                    gamma,
-                    anchor_tokens[:4].tolist(),
-                    anchor_positions[:4].tolist(),
-                    anchor_indices[:4].tolist(),
-                    tuple(anchor_context.shape),
-                    float(ctx.norm()),
-                    bool(torch.isnan(ctx).any()),
-                    draft_tokens[0].tolist(),
+                _dspark_dbg_emit(
+                    f"DSPARK_DEBUG propose: num_reqs={num_reqs} gamma={gamma} "
+                    f"anchor_tokens={anchor_tokens[:4].tolist()} "
+                    f"anchor_positions={anchor_positions[:4].tolist()} "
+                    f"anchor_indices={anchor_indices[:4].tolist()} "
+                    f"ctx_shape={tuple(anchor_context.shape)} "
+                    f"ctx_norm={float(ctx.norm()):.3f} "
+                    f"ctx_nan={bool(torch.isnan(ctx).any())} "
+                    f"draft_tokens[0]={draft_tokens[0].tolist()}"
                 )
 
         # Pad to [max_num_reqs, γ].

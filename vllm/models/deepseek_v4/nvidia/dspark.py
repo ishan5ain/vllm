@@ -80,6 +80,9 @@ logger = init_logger(__name__)
 # first few draft blocks. No-op otherwise. DSPARK_DEBUG_CALLS caps the dumps.
 _DSPARK_DEBUG = os.environ.get("DSPARK_DEBUG", "0") == "1"
 _DSPARK_DEBUG_CALLS = int(os.environ.get("DSPARK_DEBUG_CALLS", "3"))
+# Output goes to a file as well as the logger: vLLM is often launched on a pty
+# whose output is not captured by `docker logs`, so a file is the reliable sink.
+_DSPARK_DEBUG_FILE = os.environ.get("DSPARK_DEBUG_FILE", "/tmp/dspark_debug.log")
 _dspark_dbg_count = 0
 
 
@@ -89,6 +92,15 @@ def _dspark_dbg_should_log() -> bool:
         return False
     _dspark_dbg_count += 1
     return True
+
+
+def _dspark_dbg_emit(msg: str) -> None:
+    logger.info("%s", msg)
+    try:
+        with open(_DSPARK_DEBUG_FILE, "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 
 # MoE expert scales suffix detection — matches the pattern in mtp.py.
@@ -536,24 +548,19 @@ class DSparkInnerModel(nn.Module):
                 base_top = bl.topk(5, dim=-1).indices  # [γ, 5]
                 post_top = dl.topk(5, dim=-1).indices  # [γ, 5]
                 ctx = target_context[0].float()
-                logger.info(
-                    "DSPARK_DEBUG block: anchor=%d draft_tokens=%s "
-                    "ctx_norm=%.3f ctx_nan=%s",
-                    int(anchor_token_ids[0].item()),
-                    draft_tokens[0].tolist(),
-                    float(ctx.norm()),
-                    bool(torch.isnan(ctx).any()),
+                _dspark_dbg_emit(
+                    f"DSPARK_DEBUG block: anchor={int(anchor_token_ids[0].item())} "
+                    f"draft_tokens={draft_tokens[0].tolist()} "
+                    f"ctx_norm={float(ctx.norm()):.3f} "
+                    f"ctx_nan={bool(torch.isnan(ctx).any())}"
                 )
                 for k in range(gamma):
-                    logger.info(
-                        "  k=%d sampled=%d base_top5=%s post_top5=%s "
-                        "base_max=%.2f bias_max=%.2f",
-                        k,
-                        int(draft_tokens[0, k].item()),
-                        base_top[k].tolist(),
-                        post_top[k].tolist(),
-                        float(base_max[k]),
-                        float(bias_max[k]),
+                    _dspark_dbg_emit(
+                        f"  k={k} sampled={int(draft_tokens[0, k].item())} "
+                        f"base_top5={base_top[k].tolist()} "
+                        f"post_top5={post_top[k].tolist()} "
+                        f"base_max={float(base_max[k]):.2f} "
+                        f"bias_max={float(bias_max[k]):.2f}"
                     )
 
         return {
