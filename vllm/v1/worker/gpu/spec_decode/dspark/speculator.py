@@ -14,6 +14,7 @@ state addition rather than KV cache precomputation.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -23,16 +24,27 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
+
+# Env-gated diagnostics (DSPARK_DEBUG=1) for the 0%-acceptance investigation.
+_DSPARK_DEBUG = os.environ.get("DSPARK_DEBUG", "0") == "1"
+_DSPARK_DEBUG_CALLS = int(os.environ.get("DSPARK_DEBUG_CALLS", "3"))
+_dspark_dbg_count = 0
+
+
+def _dspark_dbg_should_log() -> bool:
+    global _dspark_dbg_count
+    if not _DSPARK_DEBUG or _dspark_dbg_count >= _DSPARK_DEBUG_CALLS:
+        return False
+    _dspark_dbg_count += 1
+    return True
 
 
 class DSparkSpeculator(DraftModelSpeculator):
@@ -47,9 +59,7 @@ class DSparkSpeculator(DraftModelSpeculator):
     - The DSpark context is passed via ``aux_hidden_states[0]``.
     """
 
-    def __init__(
-        self, vllm_config: VllmConfig, device: torch.device
-    ) -> None:
+    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
 
         self.hidden_states = torch.zeros(
@@ -73,8 +83,7 @@ class DSparkSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         logger.info_once(
-            "DSpark speculator: CUDA graphs not yet supported. "
-            "Running in eager mode."
+            "DSpark speculator: CUDA graphs not yet supported. Running in eager mode."
         )
 
     def capture(self, *args: Any, **kwargs: Any) -> None:
@@ -213,9 +222,7 @@ class DSparkSpeculator(DraftModelSpeculator):
         positions = input_batch.positions
 
         for req_idx in range(num_reqs):
-            qs = int(query_start_loc[req_idx].item())
             qe = int(query_start_loc[req_idx + 1].item())
-            query_len = qe - qs
             rejected = int(num_rejected[req_idx].item())
             valid_end = qe - rejected
             anchor_idx = valid_end - 1
@@ -233,8 +240,8 @@ class DSparkSpeculator(DraftModelSpeculator):
     def _prepare_dspark_inputs(
         self,
         input_batch: InputBatch,
-        anchor_tokens: torch.Tensor,       # [num_reqs]
-        anchor_positions: torch.Tensor,     # [num_reqs]
+        anchor_tokens: torch.Tensor,  # [num_reqs]
+        anchor_positions: torch.Tensor,  # [num_reqs]
     ) -> None:
         """Populate ``input_buffers`` with DSpark draft input.
 
@@ -245,12 +252,9 @@ class DSparkSpeculator(DraftModelSpeculator):
         """
         num_reqs = input_batch.num_reqs
         gamma = self.num_speculative_steps
-        device = self.device
 
         # DSpark noise token ID from model config.
-        noise_token_id = getattr(
-            self.model, "noise_token_id", 128799
-        )
+        noise_token_id = getattr(self.model, "noise_token_id", 128799)
 
         ib = self.input_buffers
         ib.input_ids.zero_()
@@ -304,12 +308,8 @@ class DSparkSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         gamma = self.num_speculative_steps
         num_query_tokens = num_reqs * gamma
-        max_seq_len = (
-            input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
-        )
-        self.draft_max_seq_len = min(
-            max_seq_len + gamma, self.max_model_len
-        )
+        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        self.draft_max_seq_len = min(max_seq_len + gamma, self.max_model_len)
 
         self._copy_request_inputs(
             num_reqs,
@@ -319,11 +319,12 @@ class DSparkSpeculator(DraftModelSpeculator):
         )
 
         # 1. Extract anchor tokens and positions.
-        anchor_tokens, anchor_positions, anchor_indices = (
-            self._get_anchor_data(
-                input_batch, num_sampled, num_rejected,
-                last_sampled, next_prefill_tokens,
-            )
+        anchor_tokens, anchor_positions, anchor_indices = self._get_anchor_data(
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
         )
 
         # 2. Get DSpark context (target layers 40, 41, 42 concatenated).
@@ -354,9 +355,7 @@ class DSparkSpeculator(DraftModelSpeculator):
         anchor_context = target_context_all[anchor_indices]  # [B, 3*D]
 
         # 3. Prepare draft inputs.
-        self._prepare_dspark_inputs(
-            input_batch, anchor_tokens, anchor_positions
-        )
+        self._prepare_dspark_inputs(input_batch, anchor_tokens, anchor_positions)
 
         # 4. Build draft attention metadata (causal=False for bidirectional).
         draft_attn_metadata = self._build_draft_attn_metadata(
@@ -395,6 +394,24 @@ class DSparkSpeculator(DraftModelSpeculator):
             )
 
         draft_tokens = result["draft_tokens"]  # [B, γ]
+
+        if _dspark_dbg_should_log():
+            with torch.no_grad():
+                ctx = anchor_context.float()
+                logger.info(
+                    "DSPARK_DEBUG propose: num_reqs=%d gamma=%d "
+                    "anchor_tokens=%s anchor_positions=%s anchor_indices=%s "
+                    "ctx_shape=%s ctx_norm=%.3f ctx_nan=%s draft_tokens[0]=%s",
+                    num_reqs,
+                    gamma,
+                    anchor_tokens[:4].tolist(),
+                    anchor_positions[:4].tolist(),
+                    anchor_indices[:4].tolist(),
+                    tuple(anchor_context.shape),
+                    float(ctx.norm()),
+                    bool(torch.isnan(ctx).any()),
+                    draft_tokens[0].tolist(),
+                )
 
         # Pad to [max_num_reqs, γ].
         padded = torch.zeros(

@@ -29,6 +29,7 @@ DSparkAttention cross-attention (per-stage ``main_kv`` in the draft KV cache),
 not by adding to the anchor embedding. See ``dspark/phase_cd_plan.md``.
 """
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -73,6 +74,22 @@ from .model import (
 )
 
 logger = init_logger(__name__)
+
+# Env-gated diagnostics for the 0%-acceptance investigation. Set DSPARK_DEBUG=1
+# to dump anchor/draft tokens and base-logits (pre/post Markov bias) for the
+# first few draft blocks. No-op otherwise. DSPARK_DEBUG_CALLS caps the dumps.
+_DSPARK_DEBUG = os.environ.get("DSPARK_DEBUG", "0") == "1"
+_DSPARK_DEBUG_CALLS = int(os.environ.get("DSPARK_DEBUG_CALLS", "3"))
+_dspark_dbg_count = 0
+
+
+def _dspark_dbg_should_log() -> bool:
+    global _dspark_dbg_count
+    if not _DSPARK_DEBUG or _dspark_dbg_count >= _DSPARK_DEBUG_CALLS:
+        return False
+    _dspark_dbg_count += 1
+    return True
+
 
 # MoE expert scales suffix detection — matches the pattern in mtp.py.
 # fp4 experts register ``..._weight_scale``; fp8 register ``..._weight_scale_inv``.
@@ -509,6 +526,35 @@ class DSparkInnerModel(nn.Module):
         draft_tokens = torch.stack(draft_tokens_list, dim=1)  # [B, γ]
         draft_logits = torch.stack(draft_logits_list, dim=1)  # [B, γ, V]
         confidence = torch.stack(confidence_list, dim=1)  # [B, γ]
+
+        if _dspark_dbg_should_log():
+            with torch.no_grad():
+                bl = base_logits[0].float()  # [γ, V] base (pre-Markov)
+                dl = draft_logits[0].float()  # [γ, V] = base + Markov bias
+                bias_max = (dl - bl).abs().amax(dim=-1)  # [γ]
+                base_max = bl.abs().amax(dim=-1)  # [γ]
+                base_top = bl.topk(5, dim=-1).indices  # [γ, 5]
+                post_top = dl.topk(5, dim=-1).indices  # [γ, 5]
+                ctx = target_context[0].float()
+                logger.info(
+                    "DSPARK_DEBUG block: anchor=%d draft_tokens=%s "
+                    "ctx_norm=%.3f ctx_nan=%s",
+                    int(anchor_token_ids[0].item()),
+                    draft_tokens[0].tolist(),
+                    float(ctx.norm()),
+                    bool(torch.isnan(ctx).any()),
+                )
+                for k in range(gamma):
+                    logger.info(
+                        "  k=%d sampled=%d base_top5=%s post_top5=%s "
+                        "base_max=%.2f bias_max=%.2f",
+                        k,
+                        int(draft_tokens[0, k].item()),
+                        base_top[k].tolist(),
+                        post_top[k].tolist(),
+                        float(base_max[k]),
+                        float(bias_max[k]),
+                    )
 
         return {
             "draft_tokens": draft_tokens,
