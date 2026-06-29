@@ -38,12 +38,24 @@ _DSPARK_DEBUG = os.environ.get("DSPARK_DEBUG", "0") == "1"
 _DSPARK_DEBUG_CALLS = int(os.environ.get("DSPARK_DEBUG_CALLS", "3"))
 # File sink: vLLM is often launched on a pty not captured by `docker logs`.
 _DSPARK_DEBUG_FILE = os.environ.get("DSPARK_DEBUG_FILE", "/tmp/dspark_debug.log")
+# Runtime toggle file (env vars don't reliably reach the worker subprocess):
+# enable with `docker exec <container> touch /tmp/dspark_debug_on` — no restart.
+_DSPARK_DEBUG_TOGGLE = os.environ.get("DSPARK_DEBUG_TOGGLE", "/tmp/dspark_debug_on")
 _dspark_dbg_count = 0
+
+
+def _dspark_dbg_enabled() -> bool:
+    if _DSPARK_DEBUG:
+        return True
+    try:
+        return os.path.exists(_DSPARK_DEBUG_TOGGLE)
+    except OSError:
+        return False
 
 
 def _dspark_dbg_should_log() -> bool:
     global _dspark_dbg_count
-    if not _DSPARK_DEBUG or _dspark_dbg_count >= _DSPARK_DEBUG_CALLS:
+    if not _dspark_dbg_enabled() or _dspark_dbg_count >= _DSPARK_DEBUG_CALLS:
         return False
     _dspark_dbg_count += 1
     return True
