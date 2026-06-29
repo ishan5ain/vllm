@@ -2,11 +2,12 @@
 
 > **Date:** 2026-06-28
 > **Branch:** `dspark-research` (fork: `github.com/ishan5ain/vllm`)
-> **Latest commit:** `ecd5e8db4` — env-gated diagnostics for the 0%-acceptance investigation
->   (on `b7aff3407` weight-loading fix, `9c83c59cb` rewire A/B/D/E/F)
+> **Latest commit:** `2a4c5ae85` — write DSPARK_DEBUG diagnostics to a FILE (pty/docker-logs
+>   capture failed); on `ecd5e8db4` diagnostics, `b7aff3407` loader fix, `9c83c59cb` rewire
 > **State:** model LOADS & SERVES with all-real weights, output coherent, but draft
->   acceptance is still **0%**. Diagnostic build committed; **pending cluster rebuild
->   with `DSPARK_DEBUG=1`** to localize the cause before implementing fix C.
+>   acceptance is still **0%** (re-confirmed 2026-06-29: 63 drafts / 315 tokens / 0 accepted).
+>   **Pending cluster rebuild @ `2a4c5ae85` with `DSPARK_DEBUG=1`**, then read
+>   `/tmp/dspark_debug.log` to localize the cause before implementing fix C.
 > **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix → loads-but-0%-acceptance → diagnostics
 
 ## Implementation Status
@@ -44,7 +45,7 @@ stronger than "weak context" alone → likely a systematic bug (anchor/position
 misalignment, Markov bias swamping base logits, or context not reaching the
 draft) in addition to the missing cross-attention. Hence diagnostics before fix C.
 
-### Diagnostics added — COMMITTED `ecd5e8db4` (env-gated, no-op unless enabled)
+### Diagnostics — COMMITTED `ecd5e8db4` + `2a4c5ae85` (env-gated, no-op unless enabled)
 
 `DSPARK_DEBUG=1` (cap via `DSPARK_DEBUG_CALLS`, default 3) dumps:
 - `forward_dspark_block` (`dspark.py`): anchor token, sampled draft tokens,
@@ -52,6 +53,23 @@ draft) in addition to the missing cross-attention. Hence diagnostics before fix 
   top-5 with base/bias magnitudes (detects Markov bias swamping base logits).
 - `DSparkSpeculator.propose` (`speculator.py`): anchor tokens/positions/indices,
   context shape/norm/nan, produced draft tokens (anchor/alignment sanity).
+
+**⚠️ Log-capture gotcha (why `2a4c5ae85` exists):** on the cluster, vLLM is
+launched on a container **pty** (`/dev/pts/0`), NOT PID 1's stdout. As a result
+`docker logs vllm_node` is empty (0-byte json.log), the pty's master reader is
+detached (a concurrent `cat /dev/pts/0` captured 0 bytes), and no tmux pane has
+the output in scrollback. So `logger.info` diagnostics were unrecoverable. Fix:
+the diagnostics now ALSO append to a file — `DSPARK_DEBUG_FILE`, default
+`/tmp/dspark_debug.log` — readable via `docker exec`. The cap counter resets each
+process start, so rebuild+relaunch gives a fresh 3 dumps.
+
+**How to retrieve (after rebuild @ `2a4c5ae85`, relaunch, one greedy request):**
+```bash
+# on spark10 (node-rank 0); the worker writes the file in its container
+docker exec vllm_node cat /tmp/dspark_debug.log
+# peer node if needed:
+ssh 192.168.0.183 "docker exec vllm_node cat /tmp/dspark_debug.log"
+```
 
 Interpretation guide:
 - `ctx_norm≈0` / `ctx_nan=True` → context not reaching draft (capture/main_proj).
@@ -266,10 +284,11 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Next Steps (Priority Order)
 
-1. **Diagnostic build** (`ecd5e8db4`) — rebuild both nodes, launch with
-   `DSPARK_DEBUG=1`, send one short greedy request, collect `DSPARK_DEBUG` log
-   lines from BOTH nodes. Use the interpretation guide above to localize the
-   cause (context / alignment / Markov-swamp / backbone).
+1. **Diagnostic build** (`2a4c5ae85`) — rebuild both nodes, launch with
+   `DSPARK_DEBUG=1`, send one short greedy request, then read
+   `/tmp/dspark_debug.log` via `docker exec` (NOT `docker logs` — see gotcha
+   above). Use the interpretation guide to localize the cause (context /
+   alignment / Markov-swamp / backbone).
 2. **Fix whatever the diagnostics reveal.** Likely either a smaller bug
    (alignment / Markov scaling / context) OR confirmation that fix C is the lever.
 3. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
@@ -283,9 +302,12 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 ### How to run the diagnostic build
 
 ```bash
-# rebuild from dspark-research @ ecd5e8db4, deploy to BOTH nodes (keep in sync)
+# rebuild from dspark-research @ 2a4c5ae85, deploy to BOTH nodes (keep in sync)
 # launch with DSPARK_DEBUG=1 in the container env (e.g. -e DSPARK_DEBUG=1)
-# send one greedy request, then:
-docker logs <vllm-node> 2>&1 | grep DSPARK_DEBUG
-ssh 192.168.0.183 "docker logs <vllm-node> 2>&1 | grep DSPARK_DEBUG"
+# send one greedy request, then read the FILE (docker logs does NOT work — pty):
+docker exec vllm_node cat /tmp/dspark_debug.log
+ssh 192.168.0.183 "docker exec vllm_node cat /tmp/dspark_debug.log"
 ```
+
+Acceptance can be measured without logs straight off `/metrics` (deltas of
+`vllm:spec_decode_num_{drafts,draft_tokens,accepted_tokens}_total`).
