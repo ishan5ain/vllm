@@ -6,9 +6,9 @@
 >   **pending cluster rebuild with `DSPARK_DEBUG=1`** to localize the cause before
 >   implementing fix C (cross-attention; designed in `dspark/phase_cd_plan.md`).
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
-> **Latest commit:** `461fe59d3` — diagnostics enable via TOGGLE FILE (env didn't
->   reach worker); on `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics, `b7aff3407`
->   loader fix, `9c83c59cb` rewire
+> **Latest commit:** `c5d4dd2a6` — propose-entry probe (localize the early return);
+>   on `461fe59d3` toggle, `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics,
+>   `b7aff3407` loader fix, `9c83c59cb` rewire
 > **Read first:** `dspark/PROGRESS.md` → "Current Status (2026-06-29)", then
 >   `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" and `dspark/phase_cd_plan.md`.
 
@@ -19,20 +19,27 @@ Integration of DeepSeek's DSpark speculative decoding into vLLM for
 
 ## Current State
 
-**The rewired model now loads (79.4 GiB, all draft params real — the completeness
+**The rewired model loads (79.4 GiB, all draft params real — the completeness
 assertion passes), serves at `http://spark10.local:8000/v1`, and generates
-coherent output. But draft acceptance is still 0%.** Fresh greedy request: 159
-drafts → 795 draft tokens → **0 accepted** (acceptance 0.00%, length 1.000). The
-target path is correct; the draft is produced but 100% rejected.
+coherent output. Acceptance is 0% because THE DRAFT MODEL NEVER RUNS.**
 
-0/795 *exact* is stronger than "weak context" alone, so a diagnostic build
-(`ecd5e8db4`, `DSPARK_DEBUG=1`) was added to localize the cause (context not
-reaching the draft / anchor-position misalignment / Markov bias swamping the base
-logits / backbone) before committing to the larger cross-attention change.
+🔴 **Real root cause (2026-06-29):** `propose()` early-returns because
+`target_context_all is None`, returning zero draft tokens that are 100% rejected.
+Established by elimination: file-based diagnostics are enabled (worker sees
+`/tmp/dspark_debug_on`, shares `/tmp`), yet `/tmp/dspark_debug.log` is never
+created on either node despite drafts being produced — so `forward_dspark_block`
+is never reached. **The target DSpark context isn't reaching the speculator; the
+draft doesn't execute.** All the weight/architecture work fixed *loading* only.
+
+The context *should* be present (`_dspark_context_buffer` allocated on last PP
+rank; getter returns it; `model_runner.py:611-614` injects it into
+`aux_hidden_states`), so `c5d4dd2a6` adds a **propose-entry probe** (before the
+early return) dumping: propose-called, `aux` len, `_target_model` type, getter
+presence, getter buffer shape, `ctx_is_none` — to localize the loss in one run.
 
 ### Run the diagnostic build
 
-1. Rebuild from `dspark-research` @ `461fe59d3`; deploy to **both** nodes (keep
+1. Rebuild from `dspark-research` @ `c5d4dd2a6`; deploy to **both** nodes (keep
    images in sync — image skew caused the prior multi-node startup failure).
 2. Relaunch, then **enable diagnostics via the toggle file** (env doesn't reach
    the worker — see gotcha #2):
@@ -45,7 +52,11 @@ logits / backbone) before committing to the larger cross-attention change.
    docker exec vllm_node cat /tmp/dspark_debug.log
    ssh 192.168.0.183 "docker exec vllm_node cat /tmp/dspark_debug.log"
    ```
-   (Cap `DSPARK_DEBUG_CALLS`, default 3, resets per process start.)
+   (Cap `DSPARK_DEBUG_CALLS`, default 3, resets per process start.) The
+   `DSPARK_DEBUG propose-entry:` line shows `ctx_is_none` + getter buffer shape
+   → tells you where the context is lost (model_runner / getter / buffer /
+   `_target_model`). If `forward_dspark_block` runs, its `block`/`k=` lines also
+   appear (separate counter).
 
 > **⚠️ Gotcha #1 — do NOT use `docker logs`.** vLLM runs on the container pty
 > (`/dev/pts/0`), not PID 1's stdout, so `docker logs vllm_node` is empty (0-byte
@@ -173,12 +184,11 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Immediate Next Steps
 
-1. **Diagnostic build** (`461fe59d3`) — rebuild both nodes; `docker exec
+1. **Diagnostic build** (`c5d4dd2a6`) — rebuild both nodes; `docker exec
    vllm_node touch /tmp/dspark_debug_on` (both nodes); one greedy request; read
-   `/tmp/dspark_debug.log` via `docker exec` (not `docker logs`, not env-only),
-   localize the 0% cause.
-2. **Fix what the diagnostics reveal** — a smaller bug (alignment / Markov
-   scaling / context) and/or confirmation that fix C is the lever.
+   `/tmp/dspark_debug.log` → `propose-entry` line localizes the lost context.
+2. **Fix the context plumbing** so `target_context_all` is non-None and the
+   draft actually executes (current blocker), then re-measure acceptance.
 3. **Implement proper C** (cross-attention) per `dspark/phase_cd_plan.md`
    (option (a): per-stage one-token main_kv prefill into the draft KV cache).
    Remove the interim embedding addition. Target >3/5 acceptance.

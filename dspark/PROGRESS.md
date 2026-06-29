@@ -2,14 +2,15 @@
 
 > **Date:** 2026-06-28
 > **Branch:** `dspark-research` (fork: `github.com/ishan5ain/vllm`)
-> **Latest commit:** `461fe59d3` — enable diagnostics via a runtime TOGGLE FILE (env
->   didn't reach the worker); on `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics,
+> **Latest commit:** `c5d4dd2a6` — propose-entry probe to localize the early return;
+>   on `461fe59d3` toggle, `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics,
 >   `b7aff3407` loader fix, `9c83c59cb` rewire
 > **State:** model LOADS & SERVES with all-real weights, output coherent, but draft
->   acceptance is still **0%** (re-confirmed 2026-06-29). Diagnostics have NOT yet
->   produced data — the worker process lacked `DSPARK_DEBUG` (see gotcha below), now
->   fixed with a toggle file. **Pending rebuild @ `461fe59d3`**, then
->   `touch /tmp/dspark_debug_on` + one request → read `/tmp/dspark_debug.log`.
+>   acceptance is still **0%**. **REAL ROOT CAUSE FOUND (2026-06-29): the draft model
+>   never executes** — `propose()` early-returns because `target_context_all is None`,
+>   returning zero draft tokens that are 100% rejected. All the weight/architecture
+>   work fixed *loading*; the draft never even runs. **Pending rebuild @ `c5d4dd2a6`**
+>   to localize where the context is lost (model_runner / getter / buffer).
 > **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix → loads-but-0%-acceptance → diagnostics
 
 ## Implementation Status
@@ -26,8 +27,38 @@ Phase 5: STS Calibration  ░░░░░░░░░░░░ CODE EXISTS, NOT 
 ## Current Status (2026-06-29)
 
 **The rewired model loads (79.4 GiB, all draft params real — assertion passes),
-serves at `http://spark10.local:8000/v1`, and generates coherent output — but
-draft acceptance is still 0%.** Next action: diagnostic build (`DSPARK_DEBUG=1`).
+serves at `http://spark10.local:8000/v1`, generates coherent output — but draft
+acceptance is 0% because THE DRAFT MODEL NEVER RUNS.**
+
+### 🔴 REAL ROOT CAUSE — `propose()` early-returns (context is None)
+
+Established by elimination with the file-based diagnostics + toggle:
+- Diagnostics are enabled (worker sees `/tmp/dspark_debug_on`, shares `/tmp` —
+  verified via `/proc/<worker>/root/tmp`), yet **no `/tmp/dspark_debug.log` is
+  created on either node** despite drafts being produced.
+- The only way drafts are produced without writing the debug file is the
+  `propose()` early return — `forward_dspark_block` is never reached:
+  ```python
+  if target_context_all is None:
+      logger.warning_once("DSpark speculator: no target context available...")
+      return torch.zeros(...)   # zeros counted as drafts → 100% rejected
+  ```
+- So **the target DSpark context never reaches the speculator; the draft model
+  does not execute.** This — not weak drafts — is the 0% cause, and likely
+  explains every prior session's 0%. The weight rewire fixed *loading* only.
+
+### The puzzle + the probe (`c5d4dd2a6`)
+
+Context *should* be present: `model.py` allocates `_dspark_context_buffer`
+unconditionally on the last PP rank (PP=1 here), `get_dspark_context_hidden_states`
+returns it, and `model_runner.py:611-614` inserts it into `aux_hidden_states` for
+`propose()`. All three read correct, yet context is None. Code-reading can't
+resolve it, so `c5d4dd2a6` adds a **propose-entry dump** (before the early return)
+recording: is `propose` called, `aux` length, `_target_model` type, getter
+presence, **getter buffer shape**, `ctx_is_none`. One run localizes the loss to
+model_runner plumbing vs getter vs buffer vs `_target_model` wiring.
+
+### Original (now superseded) plan: localize via base_logits diagnostics
 
 ### Acceptance re-measured after the rewire (2026-06-29)
 
@@ -273,8 +304,8 @@ vllm/model_executor/layers/sparse_attn_indexer.py  cooperative_topk Blackwell fi
 | Gap | Severity | Notes |
 |---|---|---|
 | Architecture mismatch vs checkpoint | RESOLVED (untested) | A/B/D/E/F rewired this session; assertion passes. Needs cluster build. |
-| **0% acceptance after rewire** | **BLOCKER** | Model loads/serves with real weights but 0/795 draft tokens accepted (greedy). Diagnostic build `ecd5e8db4` (`DSPARK_DEBUG=1`) pending to localize cause. |
-| **Context via cross-attention (fix C)** | **HIGH** | Only INTERIM (embedding add) in place. Proper per-stage `main_kv` cross-attention pending — see `dspark/phase_cd_plan.md`. Leading suspect for 0%. |
+| **Draft never runs (context is None)** | **BLOCKER** | `propose()` early-returns (`target_context_all is None`) → zero drafts → 0% acceptance. Probe `c5d4dd2a6` pending to localize where the context is lost. THIS is the active 0% cause. |
+| Context via cross-attention (fix C) | HIGH (later) | Interim embedding-add; proper per-stage `main_kv` cross-attention still pending. Only relevant AFTER the draft actually runs. |
 | `main_proj` fp8 scale loading | Medium-RESOLVED | Model loaded without KeyError on `main_proj.weight_scale_inv`, so the fp8 scale resolved. Confirm value sanity via `ctx_norm` in diagnostics. |
 | Markov head correctness | Medium | Verified against paper + reference `forward_head` — logic correct; depends on correct inputs (now wired) |
 | Confidence head unused | Medium | Scores computed but Phase 4 scheduling not implemented |
@@ -304,13 +335,15 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Next Steps (Priority Order)
 
-1. **Diagnostic build** (`461fe59d3`) — rebuild both nodes; `docker exec
+1. **Diagnostic build** (`c5d4dd2a6`) — rebuild both nodes; `docker exec
    vllm_node touch /tmp/dspark_debug_on` (both nodes), send one short greedy
    request, then read `/tmp/dspark_debug.log` via `docker exec` (NOT `docker
-   logs`; NOT just the env var — see gotchas above). Use the interpretation
-   guide to localize the cause (context / alignment / Markov-swamp / backbone).
-2. **Fix whatever the diagnostics reveal.** Likely either a smaller bug
-   (alignment / Markov scaling / context) OR confirmation that fix C is the lever.
+   logs`; NOT just the env var — see gotchas above). Read the
+   `DSPARK_DEBUG propose-entry:` line to localize where the context is lost.
+2. **Fix the context plumbing** so `target_context_all` is non-None and
+   `forward_dspark_block` actually runs (the current blocker). THEN re-measure
+   acceptance; if still low, use the base_logits/anchor diagnostics (context /
+   alignment / Markov-swamp / backbone) to localize.
 3. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
    — per-stage one-token `main_kv` prefill into the draft KV cache; remove the
    interim embedding add. Target >3/5 acceptance.
@@ -322,7 +355,7 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 ### How to run the diagnostic build
 
 ```bash
-# rebuild from dspark-research @ 461fe59d3, deploy to BOTH nodes (keep in sync)
+# rebuild from dspark-research @ c5d4dd2a6, deploy to BOTH nodes (keep in sync)
 # relaunch, then enable diagnostics WITHOUT env/restart by touching the toggle:
 docker exec vllm_node touch /tmp/dspark_debug_on
 ssh 192.168.0.183 "docker exec vllm_node touch /tmp/dspark_debug_on"
