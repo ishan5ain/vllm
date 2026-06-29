@@ -6,8 +6,9 @@
 >   **pending cluster rebuild with `DSPARK_DEBUG=1`** to localize the cause before
 >   implementing fix C (cross-attention; designed in `dspark/phase_cd_plan.md`).
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
-> **Latest commit:** `2a4c5ae85` — DSPARK_DEBUG writes to a FILE (pty/docker-logs
->   capture failed); on `ecd5e8db4` diagnostics, `b7aff3407` loader fix, `9c83c59cb` rewire
+> **Latest commit:** `461fe59d3` — diagnostics enable via TOGGLE FILE (env didn't
+>   reach worker); on `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics, `b7aff3407`
+>   loader fix, `9c83c59cb` rewire
 > **Read first:** `dspark/PROGRESS.md` → "Current Status (2026-06-29)", then
 >   `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" and `dspark/phase_cd_plan.md`.
 
@@ -31,23 +32,32 @@ logits / backbone) before committing to the larger cross-attention change.
 
 ### Run the diagnostic build
 
-1. Rebuild from `dspark-research` @ `2a4c5ae85`; deploy to **both** nodes (keep
+1. Rebuild from `dspark-research` @ `461fe59d3`; deploy to **both** nodes (keep
    images in sync — image skew caused the prior multi-node startup failure).
-2. Launch with `DSPARK_DEBUG=1` in the container env (caps to first 3 blocks via
-   `DSPARK_DEBUG_CALLS`; counter resets each process start). Send one short
-   greedy request.
-3. Read the diagnostics **from the file** (see gotcha below), with the
-   interpretation guide in `PROGRESS.md`:
+2. Relaunch, then **enable diagnostics via the toggle file** (env doesn't reach
+   the worker — see gotcha #2):
+   ```
+   docker exec vllm_node touch /tmp/dspark_debug_on
+   ssh 192.168.0.183 "docker exec vllm_node touch /tmp/dspark_debug_on"
+   ```
+3. Send one short greedy request, then read the diagnostics **from the file**:
    ```
    docker exec vllm_node cat /tmp/dspark_debug.log
    ssh 192.168.0.183 "docker exec vllm_node cat /tmp/dspark_debug.log"
    ```
+   (Cap `DSPARK_DEBUG_CALLS`, default 3, resets per process start.)
 
-> **⚠️ Do NOT use `docker logs` for DSpark diagnostics.** vLLM runs on the
-> container pty (`/dev/pts/0`), not PID 1's stdout, so `docker logs vllm_node` is
-> empty (0-byte json.log) and the pty master reader is detached (can't `cat` it).
-> That is why `2a4c5ae85` writes diagnostics to `/tmp/dspark_debug.log`
-> (`DSPARK_DEBUG_FILE`). Acceptance itself is readable any time from `/metrics`.
+> **⚠️ Gotcha #1 — do NOT use `docker logs`.** vLLM runs on the container pty
+> (`/dev/pts/0`), not PID 1's stdout, so `docker logs vllm_node` is empty (0-byte
+> json.log) and the pty master reader is detached (can't `cat` it). That's why
+> `2a4c5ae85` writes diagnostics to `/tmp/dspark_debug.log` (`DSPARK_DEBUG_FILE`).
+>
+> **⚠️ Gotcha #2 — env doesn't reach the worker.** PID 1 is `sleep infinity`;
+> vLLM is `docker exec`-ed in. `-e DSPARK_DEBUG=1` lands in the container
+> `Config.Env` but NOT in the vLLM worker's environ, so the env gate stayed off
+> (empty file despite drafts). That's why `461fe59d3` adds the `/tmp/dspark_debug_on`
+> toggle (`DSPARK_DEBUG_TOGGLE`), checked per call — enable with `docker exec
+> touch`, no restart. Acceptance itself is readable any time from `/metrics`.
 
 The last measured 0% (and the earlier per-position 0%) is consistent across the
 pre- and post-rewire builds — the rewire fixed *loading*, not yet acceptance.
@@ -163,9 +173,10 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Immediate Next Steps
 
-1. **Diagnostic build** (`2a4c5ae85`, `DSPARK_DEBUG=1`) — rebuild both nodes,
-   one greedy request, read `/tmp/dspark_debug.log` via `docker exec` (not
-   `docker logs`), localize the 0% cause.
+1. **Diagnostic build** (`461fe59d3`) — rebuild both nodes; `docker exec
+   vllm_node touch /tmp/dspark_debug_on` (both nodes); one greedy request; read
+   `/tmp/dspark_debug.log` via `docker exec` (not `docker logs`, not env-only),
+   localize the 0% cause.
 2. **Fix what the diagnostics reveal** — a smaller bug (alignment / Markov
    scaling / context) and/or confirmation that fix C is the lever.
 3. **Implement proper C** (cross-attention) per `dspark/phase_cd_plan.md`

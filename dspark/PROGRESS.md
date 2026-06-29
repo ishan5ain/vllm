@@ -2,12 +2,14 @@
 
 > **Date:** 2026-06-28
 > **Branch:** `dspark-research` (fork: `github.com/ishan5ain/vllm`)
-> **Latest commit:** `2a4c5ae85` — write DSPARK_DEBUG diagnostics to a FILE (pty/docker-logs
->   capture failed); on `ecd5e8db4` diagnostics, `b7aff3407` loader fix, `9c83c59cb` rewire
+> **Latest commit:** `461fe59d3` — enable diagnostics via a runtime TOGGLE FILE (env
+>   didn't reach the worker); on `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics,
+>   `b7aff3407` loader fix, `9c83c59cb` rewire
 > **State:** model LOADS & SERVES with all-real weights, output coherent, but draft
->   acceptance is still **0%** (re-confirmed 2026-06-29: 63 drafts / 315 tokens / 0 accepted).
->   **Pending cluster rebuild @ `2a4c5ae85` with `DSPARK_DEBUG=1`**, then read
->   `/tmp/dspark_debug.log` to localize the cause before implementing fix C.
+>   acceptance is still **0%** (re-confirmed 2026-06-29). Diagnostics have NOT yet
+>   produced data — the worker process lacked `DSPARK_DEBUG` (see gotcha below), now
+>   fixed with a toggle file. **Pending rebuild @ `461fe59d3`**, then
+>   `touch /tmp/dspark_debug_on` + one request → read `/tmp/dspark_debug.log`.
 > **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix → loads-but-0%-acceptance → diagnostics
 
 ## Implementation Status
@@ -45,31 +47,49 @@ stronger than "weak context" alone → likely a systematic bug (anchor/position
 misalignment, Markov bias swamping base logits, or context not reaching the
 draft) in addition to the missing cross-attention. Hence diagnostics before fix C.
 
-### Diagnostics — COMMITTED `ecd5e8db4` + `2a4c5ae85` (env-gated, no-op unless enabled)
+### Diagnostics — COMMITTED `ecd5e8db4` + `2a4c5ae85` + `461fe59d3` (no-op unless enabled)
 
-`DSPARK_DEBUG=1` (cap via `DSPARK_DEBUG_CALLS`, default 3) dumps:
+Enable with `DSPARK_DEBUG=1` **or** `touch /tmp/dspark_debug_on` (cap via
+`DSPARK_DEBUG_CALLS`, default 3). Dumps:
 - `forward_dspark_block` (`dspark.py`): anchor token, sampled draft tokens,
   `target_context` norm/nan, and per-step `base_logits` top-5 vs post-Markov
   top-5 with base/bias magnitudes (detects Markov bias swamping base logits).
 - `DSparkSpeculator.propose` (`speculator.py`): anchor tokens/positions/indices,
   context shape/norm/nan, produced draft tokens (anchor/alignment sanity).
 
-**⚠️ Log-capture gotcha (why `2a4c5ae85` exists):** on the cluster, vLLM is
-launched on a container **pty** (`/dev/pts/0`), NOT PID 1's stdout. As a result
-`docker logs vllm_node` is empty (0-byte json.log), the pty's master reader is
-detached (a concurrent `cat /dev/pts/0` captured 0 bytes), and no tmux pane has
-the output in scrollback. So `logger.info` diagnostics were unrecoverable. Fix:
-the diagnostics now ALSO append to a file — `DSPARK_DEBUG_FILE`, default
-`/tmp/dspark_debug.log` — readable via `docker exec`. The cap counter resets each
-process start, so rebuild+relaunch gives a fresh 3 dumps.
+**⚠️ Two cluster gotchas this took to nail down:**
 
-**How to retrieve (after rebuild @ `2a4c5ae85`, relaunch, one greedy request):**
+1. **Log capture (why `2a4c5ae85` exists):** vLLM runs on a container **pty**
+   (`/dev/pts/0`), NOT PID 1's stdout. So `docker logs vllm_node` is empty
+   (0-byte json.log), the pty master reader is detached (a concurrent
+   `cat /dev/pts/0` got 0 bytes), and no tmux pane has it in scrollback.
+   → diagnostics now ALSO append to a file (`DSPARK_DEBUG_FILE`, default
+   `/tmp/dspark_debug.log`), readable via `docker exec`.
+
+2. **Env doesn't reach the worker (why `461fe59d3` exists):** PID 1 in the
+   container is `sleep infinity`; vLLM is launched by a separate `docker exec`.
+   The launcher's `-e DSPARK_DEBUG=1` lands in the container `Config.Env` (and a
+   fresh `docker exec printenv` shows it), but it does **NOT** reach the actual
+   vLLM worker subprocess (`/proc/<worker>/environ` had no `DSPARK_*`). So the
+   env-at-import gate stayed `False` and the first toggle run produced an EMPTY
+   file even though 47 drafts were generated. (This means we still don't know
+   whether the draft early-returns or runs-but-wrong — the next run reveals it.)
+   → diagnostics are now enabled if `DSPARK_DEBUG=1` **OR** the file
+   `/tmp/dspark_debug_on` exists (`DSPARK_DEBUG_TOGGLE`), checked per call.
+
+**How to capture (after rebuild @ `461fe59d3`, relaunch):**
 ```bash
-# on spark10 (node-rank 0); the worker writes the file in its container
+docker exec vllm_node touch /tmp/dspark_debug_on            # enable (both nodes)
+ssh 192.168.0.183 "docker exec vllm_node touch /tmp/dspark_debug_on"
+# send ONE greedy request, then read the file:
 docker exec vllm_node cat /tmp/dspark_debug.log
-# peer node if needed:
 ssh 192.168.0.183 "docker exec vllm_node cat /tmp/dspark_debug.log"
 ```
+The cap counter (`DSPARK_DEBUG_CALLS`, default 3) resets per process start; for a
+fresh 3 dumps after it's exhausted, restart vLLM. No-rebuild shortcut to try
+first: relaunch, then `docker exec vllm_node sh -c 'tr "\0" "\n" <
+/proc/$(pgrep -f "vllm serve"|head -1)/environ | grep DSPARK'` — if it prints
+`DSPARK_DEBUG=1`, the current image already logs.
 
 Interpretation guide:
 - `ctx_norm≈0` / `ctx_nan=True` → context not reaching draft (capture/main_proj).
@@ -284,11 +304,11 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Next Steps (Priority Order)
 
-1. **Diagnostic build** (`2a4c5ae85`) — rebuild both nodes, launch with
-   `DSPARK_DEBUG=1`, send one short greedy request, then read
-   `/tmp/dspark_debug.log` via `docker exec` (NOT `docker logs` — see gotcha
-   above). Use the interpretation guide to localize the cause (context /
-   alignment / Markov-swamp / backbone).
+1. **Diagnostic build** (`461fe59d3`) — rebuild both nodes; `docker exec
+   vllm_node touch /tmp/dspark_debug_on` (both nodes), send one short greedy
+   request, then read `/tmp/dspark_debug.log` via `docker exec` (NOT `docker
+   logs`; NOT just the env var — see gotchas above). Use the interpretation
+   guide to localize the cause (context / alignment / Markov-swamp / backbone).
 2. **Fix whatever the diagnostics reveal.** Likely either a smaller bug
    (alignment / Markov scaling / context) OR confirmation that fix C is the lever.
 3. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
@@ -302,8 +322,10 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 ### How to run the diagnostic build
 
 ```bash
-# rebuild from dspark-research @ 2a4c5ae85, deploy to BOTH nodes (keep in sync)
-# launch with DSPARK_DEBUG=1 in the container env (e.g. -e DSPARK_DEBUG=1)
+# rebuild from dspark-research @ 461fe59d3, deploy to BOTH nodes (keep in sync)
+# relaunch, then enable diagnostics WITHOUT env/restart by touching the toggle:
+docker exec vllm_node touch /tmp/dspark_debug_on
+ssh 192.168.0.183 "docker exec vllm_node touch /tmp/dspark_debug_on"
 # send one greedy request, then read the FILE (docker logs does NOT work — pty):
 docker exec vllm_node cat /tmp/dspark_debug.log
 ssh 192.168.0.183 "docker exec vllm_node cat /tmp/dspark_debug.log"
