@@ -1,17 +1,42 @@
 # DSpark vLLM Integration — Progress & State
 
-> **Date:** 2026-06-28
+> **Date:** 2026-06-29
 > **Branch:** `dspark-research` (fork: `github.com/ishan5ain/vllm`)
-> **Latest commit:** `c5d4dd2a6` — propose-entry probe to localize the early return;
->   on `461fe59d3` toggle, `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics,
->   `b7aff3407` loader fix, `9c83c59cb` rewire
-> **State:** model LOADS & SERVES with all-real weights, output coherent, but draft
->   acceptance is still **0%**. **REAL ROOT CAUSE FOUND (2026-06-29): the draft model
->   never executes** — `propose()` early-returns because `target_context_all is None`,
->   returning zero draft tokens that are 100% rejected. All the weight/architecture
->   work fixed *loading*; the draft never even runs. **Pending rebuild @ `c5d4dd2a6`**
->   to localize where the context is lost (model_runner / getter / buffer).
-> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix → loads-but-0%-acceptance → diagnostics
+> **Latest commit:** `eb2377bee` (`c5d4dd2a6`) — diagnostics era (now superseded)
+>
+> ## 🔁 PIVOT (2026-06-29): adopt upstream PR #46995 — STOP debugging our path
+>
+> An official DSpark implementation landed as
+> **[vLLM PR #46995](https://github.com/vllm-project/vllm/pull/46995)** (by the
+> DFlash author). Comparing it to our branch shows our 0%/"context is None"
+> blocker is **not a bug to fix** — it's a symptom of two wrong architectural
+> choices. The PR solves both with existing machinery and is a thin subclass of
+> DFlash. **Decision: pivot to the PR.** Our weight anatomy (A/B/D/E/F) was
+> correct and transfers directly.
+>
+> - **Full comparison:** `dspark/PR_46995_COMPARISON.md`
+> - **Step-by-step migration (keep/replace/delete/add per file):** `dspark/MIGRATION_PLAN.md`
+> - **The two things we got wrong:** (1) context should flow via the **EAGLE3
+>   `aux_hidden_states`** path (`SupportsEagle3`), NOT our custom
+>   `_dspark_context_buffer`; (2) non-causal block attention is done by **expanding
+>   Sparse-MLA top-k indices** to include future block tokens, NOT a hand-rolled
+>   cross-attention. Base class should be `DFlashSpeculator`, not
+>   `SpecDecodeBaseProposer`.
+> - **Top risk for GB10:** the PR's Sparse-MLA path is tested on sm_100/sm_120;
+>   **GB10 is sm_121** — validate `test_dspark_noncausal_sparse_mla.py` on the box
+>   first.
+>
+> **Everything below is HISTORICAL** — the record of our hand-rolled attempt. It
+> stays for the confirmed weight archaeology and the cluster gotchas (pty logs,
+> env-to-worker, image sync), which remain useful post-migration.
+>
+> ---
+>
+> **State (historical):** model LOADS & SERVES with all-real weights, output
+> coherent, but draft acceptance is **0%** because `propose()` early-returns
+> (`target_context_all is None`) — the draft never executes. This is the symptom
+> the pivot resolves.
+> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix → loads-but-0%-acceptance → diagnostics → **PR #46995 comparison → pivot**
 
 ## Implementation Status
 
@@ -333,24 +358,34 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 ./launch-cluster.sh stop
 ```
 
-## Next Steps (Priority Order)
+## Next Steps (Priority Order) — POST-PIVOT
 
-1. **Diagnostic build** (`c5d4dd2a6`) — rebuild both nodes; `docker exec
-   vllm_node touch /tmp/dspark_debug_on` (both nodes), send one short greedy
-   request, then read `/tmp/dspark_debug.log` via `docker exec` (NOT `docker
-   logs`; NOT just the env var — see gotchas above). Read the
-   `DSPARK_DEBUG propose-entry:` line to localize where the context is lost.
-2. **Fix the context plumbing** so `target_context_all` is non-None and
-   `forward_dspark_block` actually runs (the current blocker). THEN re-measure
-   acceptance; if still low, use the base_logits/anchor diagnostics (context /
-   alignment / Markov-swamp / backbone) to localize.
-3. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
-   — per-stage one-token `main_kv` prefill into the draft KV cache; remove the
-   interim embedding add. Target >3/5 acceptance.
-4. **Verify Markov head end-to-end** vs reference `forward_head`.
-5. **Phase 3b: DSpark CUDA graphs** — build `DSparkCudaGraphManager` (see `phase3_cudagraph_plan.md`)
-6. **Phase 4: Confidence-based scheduling** — integrate confidence head
-7. **Phase 5: STS calibration** — run `dspark/sts_calibration.py`
+See `dspark/MIGRATION_PLAN.md` for the detailed, file-by-file plan. Summary:
+
+1. **Phase M0 — Merge the PR.** `git fetch https://github.com/benchislett/vllm.git
+   dspark:pr-46995`, tag our work (`git tag dspark-handrolled-archive`), then
+   `git merge pr-46995`. Resolve conflicts by taking the PR side except for our
+   GB10 keeps (`sparse_attn_indexer.py` cooperative_topk fallback). Delete the
+   obsolete files (`dspark_proposer.py`, our diagnostics scaffolding).
+2. **Phase M1 — GB10 kernel validation (BLOCKER).** Run
+   `tests/v1/attention/test_dspark_noncausal_sparse_mla.py` on the GB10 box.
+   Confirm a Sparse-MLA backend (FlashMLA / FlashInfer TRTLLM) passes on sm_121,
+   or arrange a fallback.
+3. **Phase M2 — Build & serve** from the migrated branch (both nodes, same image).
+4. **Phase M3 — Measure acceptance** (greedy, `/metrics`). Target AL ≈ 5.
+5. **Phase M4 — Flash-config reconciliation** (`n_mtp_layers`,
+   `dspark_target_layer_ids`, `dspark_markov_rank`, `dspark_noise_token_id`,
+   `hc_mult`, `hc_eps`) — PR was authored against DSV4-Pro; we run Flash.
+
+Deferred (out of scope in the PR too): confidence-based scheduling, dynamic
+drafting, STS calibration — our Phase 4/5.
+
+### Historical next-steps (our hand-rolled path — superseded by the pivot)
+
+1. ~~Diagnostic build (`c5d4dd2a6`) to localize where the context is lost.~~
+2. ~~Fix the context plumbing so `target_context_all` is non-None.~~
+3. ~~Implement proper fix C (cross-attention) per `phase_cd_plan.md`.~~
+   → Replaced by the PR's Sparse-MLA index expansion + `precompute_and_store_context_kv`.
 
 ### How to run the diagnostic build
 

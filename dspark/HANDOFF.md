@@ -1,16 +1,30 @@
 # DSpark vLLM Integration — Handoff
 
 > **Date:** 2026-06-29
-> **Status:** 🔧 LOADS & SERVES with all-real weights and coherent output, but
->   draft acceptance is **0%** (greedy: 0/795 tokens). Diagnostic build committed;
->   **pending cluster rebuild with `DSPARK_DEBUG=1`** to localize the cause before
->   implementing fix C (cross-attention; designed in `dspark/phase_cd_plan.md`).
+> **Status:** 🔁 **PIVOTING to upstream PR #46995.** Our hand-rolled integration
+>   loads & serves but is stuck at 0% acceptance because of two wrong
+>   architectural choices (custom context buffer; hand-rolled non-causal
+>   attention). An official DSpark PR by the DFlash author solves both with
+>   existing machinery. Decision: adopt the PR; keep our (confirmed) weight
+>   anatomy and GB10 fixes.
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
-> **Latest commit:** `c5d4dd2a6` — propose-entry probe (localize the early return);
->   on `461fe59d3` toggle, `2a4c5ae85` file-sink, `ecd5e8db4` diagnostics,
->   `b7aff3407` loader fix, `9c83c59cb` rewire
-> **Read first:** `dspark/PROGRESS.md` → "Current Status (2026-06-29)", then
->   `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" and `dspark/phase_cd_plan.md`.
+> **Latest commit:** `eb2377bee` (`c5d4dd2a6`) — diagnostics era (superseded by pivot)
+> **PR to adopt:** [vLLM #46995](https://github.com/vllm-project/vllm/pull/46995),
+>   branch `benchislett:dspark` @ `8b82d11`, base `main`, MERGEABLE.
+>
+> **Read first (in order):**
+> 1. `dspark/PR_46995_COMPARISON.md` — what we missed / got right / GB10 insights.
+> 2. `dspark/MIGRATION_PLAN.md` — step-by-step adoption (keep/replace/delete/add).
+> 3. `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" — confirmed by the PR.
+>
+> ⚠️ Do NOT continue the diagnostic / "context is None" investigation — that path
+> is being deleted. The early-return we were probing does not exist in the PR.
+>
+> ---
+> **Historical status:** 🔧 LOADS & SERVES with all-real weights and coherent
+> output, but draft acceptance is **0%** (greedy: 0/795 tokens) because
+> `propose()` early-returns (`target_context_all is None`) — the draft never
+> executes. The pivot resolves this structurally.
 
 ## What This Is
 
@@ -182,20 +196,28 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 ./run-recipe.sh deepseek-v4-flash-dspark --no-ray
 ```
 
-## Immediate Next Steps
+## Immediate Next Steps — POST-PIVOT (see `dspark/MIGRATION_PLAN.md`)
 
-1. **Diagnostic build** (`c5d4dd2a6`) — rebuild both nodes; `docker exec
-   vllm_node touch /tmp/dspark_debug_on` (both nodes); one greedy request; read
-   `/tmp/dspark_debug.log` → `propose-entry` line localizes the lost context.
-2. **Fix the context plumbing** so `target_context_all` is non-None and the
-   draft actually executes (current blocker), then re-measure acceptance.
-3. **Implement proper C** (cross-attention) per `dspark/phase_cd_plan.md`
-   (option (a): per-stage one-token main_kv prefill into the draft KV cache).
-   Remove the interim embedding addition. Target >3/5 acceptance.
-4. **Verify Markov head end-to-end** against the reference `forward_head` loop.
-5. **Phase 3b: DSpark CUDA graphs** — build DSparkCudaGraphManager (see `phase3_cudagraph_plan.md`)
-6. **Phase 4: Confidence scheduling** — integrate confidence head
-7. **Phase 5: STS calibration** — calibrate acceptance thresholds
+1. **Merge PR #46995** (`git fetch https://github.com/benchislett/vllm.git
+   dspark:pr-46995`; `git tag dspark-handrolled-archive`; `git merge pr-46995`).
+   Take the PR side on conflicts; keep our `sparse_attn_indexer.py` cooperative_topk
+   fallback; delete `dspark_proposer.py` + our diagnostics scaffolding.
+2. **Validate Sparse-MLA on GB10 (sm_121) — BLOCKER.** Run
+   `tests/v1/attention/test_dspark_noncausal_sparse_mla.py` on the box; confirm a
+   backend passes or arrange a fallback.
+3. **Build & serve** from the migrated branch (both nodes, same image).
+4. **Measure acceptance** (greedy, `/metrics`). Target AL ≈ 5.
+5. **Reconcile Flash config** field names (`n_mtp_layers`, `dspark_*`, `hc_*`).
+
+Deferred (out of scope upstream too): confidence scheduling, dynamic drafting,
+STS calibration.
+
+### Historical next-steps (hand-rolled path — superseded)
+
+~~Diagnostic build → fix context plumbing → implement cross-attention (fix C) →
+verify Markov head → DSpark CUDA graphs.~~ Replaced by adopting the PR, whose
+EAGLE3 aux path + Sparse-MLA non-causal attention + DFlash-based speculator cover
+all of these.
 
 ## Risks / open questions
 

@@ -1,13 +1,25 @@
 # DSpark vLLM Integration — Research Index
 
+> **🔁 2026-06-29 PIVOT:** We are adopting the upstream
+> [vLLM PR #46995](https://github.com/vllm-project/vllm/pull/46995) instead of
+> our hand-rolled integration. Start with **`PR_46995_COMPARISON.md`** and
+> **`MIGRATION_PLAN.md`**. The hand-rolled docs below (and `phase_cd_plan.md`)
+> are now historical; the weight anatomy in `checkpoint_anatomy.md` remains
+> confirmed and valid.
+
 ## Files in this directory
 
 | File | Purpose |
 |---|---|
-| `IMPLEMENTATION_PLAN.md` | Full implementation roadmap, phases 1-5, open questions |
+| `PR_46995_COMPARISON.md` | **(start here)** Our approach vs. upstream PR #46995 — what we missed/got right, GB10 insights |
+| `MIGRATION_PLAN.md` | **(then here)** Step-by-step adoption of PR #46995 (keep/replace/delete/add per file, phases, GB10 risk) |
+| `PROGRESS.md` | Progress & state (pivot note at top; hand-rolled history below) |
+| `HANDOFF.md` | Handoff (pivot note at top; hand-rolled history below) |
+| `IMPLEMENTATION_PLAN.md` | Full implementation roadmap, phases 1-5, open questions (historical) |
 | `ALGORITHM_REFERENCE.md` | Paper equations, inference flow, production adaptations |
-| `checkpoint_anatomy.md` | Exact weight structure, shapes, layer mapping |
-| `dspark_model_skeleton.py` | Python skeleton with class stubs and weight loading map |
+| `checkpoint_anatomy.md` | Exact weight structure, shapes, layer mapping (✅ confirmed by PR #46995) |
+| `phase_cd_plan.md` | Our hand-rolled cross-attention design (SUPERSEDED by PR's Sparse-MLA approach) |
+| `dspark_model_skeleton.py` | Python skeleton with class stubs and weight loading map (historical) |
 
 ## External References
 
