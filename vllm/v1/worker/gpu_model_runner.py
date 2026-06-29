@@ -179,7 +179,6 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.dspark_proposer import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -613,10 +612,6 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.method == "dspark":
-                self.drafter = DSparkProposer(
-                    vllm_config=self.vllm_config, device=self.device, runner=self
-                )
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
@@ -2478,7 +2473,6 @@ class GPUModelRunner(
                     (
                         EagleProposer,
                         DFlashProposer,
-                        DSparkProposer,
                         Gemma4Proposer,
                         ExtractHiddenStatesProposer,
                     ),
@@ -4526,7 +4520,6 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
-                    | DSparkProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -5010,11 +5003,10 @@ class GPUModelRunner(
             spec_config.use_eagle()
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
-            or spec_config.method == "dspark"
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | DSparkProposer | Gemma4Proposer,
+                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5981,7 +5973,6 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
-                    | DSparkProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -6886,7 +6877,7 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | DSparkProposer | Gemma4Proposer,
+                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6941,7 +6932,6 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer
                 | DFlashProposer
-                | DSparkProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )

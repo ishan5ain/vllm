@@ -193,7 +193,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
-            if self.speculative_config.method in ("eagle3", "dflash"):
+            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
@@ -605,19 +605,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            # Inject DSpark context (target layers 40,41,42) into
-            # aux_hidden_states for the DSpark speculator.
-            dspark_aux = list(aux_hidden_states) if aux_hidden_states else []
-            if hasattr(self.model, "get_dspark_context_hidden_states"):
-                dspark_ctx = self.model.get_dspark_context_hidden_states()
-                if dspark_ctx is not None:
-                    dspark_aux.insert(0, dspark_ctx[: hidden_states.shape[0]])
             self.speculator.propose(
                 input_batch=input_batch,
                 attn_metadata=attn_metadata,
                 slot_mappings=slot_mappings_by_layer,
                 last_hidden_states=spec_hidden_states,
-                aux_hidden_states=dspark_aux if dspark_aux else None,
+                aux_hidden_states=aux_hidden_states,
                 num_sampled=torch.ones(
                     input_batch.num_reqs, dtype=torch.int32, device=self.device
                 ),
@@ -1454,19 +1447,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            # Inject DSpark context (target layers 40,41,42) into
-            # aux_hidden_states for the DSpark speculator.
-            dspark_aux = list(aux_hidden_states) if aux_hidden_states else []
-            if hasattr(self.model, "get_dspark_context_hidden_states"):
-                dspark_ctx = self.model.get_dspark_context_hidden_states()
-                if dspark_ctx is not None:
-                    dspark_aux.insert(0, dspark_ctx[: hidden_states.shape[0]])
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
                 slot_mappings_by_layer,
                 spec_hidden_states,
-                dspark_aux if dspark_aux else None,
+                aux_hidden_states,
                 num_sampled,
                 num_rejected,
                 self.req_states.last_sampled_tokens,

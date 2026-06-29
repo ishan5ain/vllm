@@ -48,7 +48,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    MixtureOfExperts,
+    SupportsEagle3,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -927,7 +932,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-class DeepseekV4Model(nn.Module):
+class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1021,17 +1026,8 @@ class DeepseekV4Model(nn.Module):
                 self.hc_dim,
                 dtype=vllm_config.model_config.dtype,
             )
-            # DSpark context buffer: concatenated hidden states from
-            # target layers 40, 41, 42. Shape: [max_tokens, 3 * hidden_size].
-            # Populated during forward() for the DSpark draft model.
-            self._dspark_context_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                3 * self.config.hidden_size,
-                dtype=vllm_config.model_config.dtype,
-            )
         else:
             self._mtp_hidden_buffer = None
-            self._dspark_context_buffer = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1077,12 +1073,12 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        dspark_target_layers = {40, 41, 42}
-        dspark_context_parts: list[torch.Tensor] = []
-        for local_idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
+        aux_hidden_states: list[torch.Tensor] = []
+        final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
         ):
-            global_idx = self.start_layer + local_idx
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1091,35 +1087,24 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-            # Capture per-layer hidden states for DSpark context (fix D).
-            # The reference (inference/model.py Transformer.forward) captures
-            # the FULL post-mHC layer output averaged over the hc_mult streams
-            # (``h.mean(dim=2)``). In this fused design mhc_post is deferred to
-            # the next layer's mhc_pre, so the mid-loop ``hidden_states`` is the
-            # pre-mapping FFN output. Apply mhc_post here NON-destructively to
-            # reconstruct the full per-layer output, then mean over hc_mult.
-            if (
-                global_idx in dspark_target_layers
-                and self._dspark_context_buffer is not None
-            ):
-                full = mhc_post_tilelang(
+            if idx + 1 in self.aux_hidden_state_layers:
+                # Reconstruct the aux hidden state for draft models
+                aux_recon = mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
-                )  # [T, hc_mult, D]
-                dspark_context_parts.append(full.mean(dim=1))  # [T, D]
+                )
+                aux_hidden_states.append(aux_recon.mean(dim=1))
+                final_aux_recon = aux_recon
         if layer is not None:
-            hidden_states = mhc_post_tilelang(
-                hidden_states, residual, post_mix, res_mix
-            )
+            # Reuse if the last layer was captured as an aux hidden state
+            if self.end_layer in self.aux_hidden_state_layers:
+                hidden_states = final_aux_recon
+            else:
+                hidden_states = mhc_post_tilelang(
+                    hidden_states, residual, post_mix, res_mix
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
-
-        # Stash DSpark context (layers 40,41,42 concatenated) for the
-        # DSpark draft model. Concatenate along the hidden dimension.
-        if dspark_context_parts and self._dspark_context_buffer is not None:
-            dspark_ctx = torch.cat(dspark_context_parts, dim=-1)  # [T, 3*D]
-            num_tokens = dspark_ctx.shape[0]
-            self._dspark_context_buffer[:num_tokens].copy_(dspark_ctx)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -1134,6 +1119,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1360,7 +1347,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
+class DeepseekV4ForCausalLM(
+    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
+):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -1439,15 +1428,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer for the MTP draft."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
-
-    def get_dspark_context_hidden_states(self) -> torch.Tensor | None:
-        """Concatenated hidden states from target layers 40,41,42.
-
-        Shape: [max_num_batched_tokens, 3 * hidden_size].
-        Populated during forward(); valid after each target step.
-        Used by the DSpark speculator for context projection.
-        """
-        return getattr(self.model, "_dspark_context_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
