@@ -1,14 +1,15 @@
 # DSpark vLLM Integration — Handoff
 
-> **Date:** 2026-06-28
-> **Status:** 🔧 ARCHITECTURE REWIRED to match checkpoint (A/B/D/E/F) + weight
->   loading fixed. COMMITTED & lint-clean; **pending cluster rebuild** to confirm
->   load + re-measure acceptance. Fix C (cross-attention) is INTERIM — proper
->   version designed in `dspark/phase_cd_plan.md`.
+> **Date:** 2026-06-29
+> **Status:** 🔧 LOADS & SERVES with all-real weights and coherent output, but
+>   draft acceptance is **0%** (greedy: 0/795 tokens). Diagnostic build committed;
+>   **pending cluster rebuild with `DSPARK_DEBUG=1`** to localize the cause before
+>   implementing fix C (cross-attention; designed in `dspark/phase_cd_plan.md`).
 > **Branch:** `dspark-research` on `github.com/ishan5ain/vllm`
-> **Latest commit:** `b7aff3407` — weight-loading fix (on `9c83c59cb` — rewire)
-> **Read first:** `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING", then
->   `dspark/phase_cd_plan.md`, then `dspark/PROGRESS.md`.
+> **Latest commit:** `ecd5e8db4` — env-gated diagnostics (on `b7aff3407` loader
+>   fix, `9c83c59cb` rewire)
+> **Read first:** `dspark/PROGRESS.md` → "Current Status (2026-06-29)", then
+>   `dspark/checkpoint_anatomy.md` → "✅ VERIFIED MAPPING" and `dspark/phase_cd_plan.md`.
 
 ## What This Is
 
@@ -17,11 +18,31 @@ Integration of DeepSeek's DSpark speculative decoding into vLLM for
 
 ## Current State
 
-**The draft model has been rewired to match the checkpoint (A/B/D/E/F) and the
-weight loading fixed; both are committed (`9c83c59cb`, `b7aff3407`) and
-lint-clean. Pending a cluster rebuild to confirm the model loads and to
-re-measure acceptance.** The last measured acceptance (0% across all 5
-positions) predates these fixes.
+**The rewired model now loads (79.4 GiB, all draft params real — the completeness
+assertion passes), serves at `http://spark10.local:8000/v1`, and generates
+coherent output. But draft acceptance is still 0%.** Fresh greedy request: 159
+drafts → 795 draft tokens → **0 accepted** (acceptance 0.00%, length 1.000). The
+target path is correct; the draft is produced but 100% rejected.
+
+0/795 *exact* is stronger than "weak context" alone, so a diagnostic build
+(`ecd5e8db4`, `DSPARK_DEBUG=1`) was added to localize the cause (context not
+reaching the draft / anchor-position misalignment / Markov bias swamping the base
+logits / backbone) before committing to the larger cross-attention change.
+
+### Run the diagnostic build
+
+1. Rebuild from `dspark-research` @ `ecd5e8db4`; deploy to **both** nodes (keep
+   images in sync — image skew caused the prior multi-node startup failure).
+2. Launch with `DSPARK_DEBUG=1` in the container env (caps to first 3 blocks via
+   `DSPARK_DEBUG_CALLS`). Send one short greedy request.
+3. Collect logs from both nodes and read with the guide in `PROGRESS.md`:
+   ```
+   docker logs <vllm-node> 2>&1 | grep DSPARK_DEBUG
+   ssh 192.168.0.183 "docker logs <vllm-node> 2>&1 | grep DSPARK_DEBUG"
+   ```
+
+The last measured 0% (and the earlier per-position 0%) is consistent across the
+pre- and post-rewire builds — the rewire fixed *loading*, not yet acceptance.
 
 **Root cause (verified 2026-06-28 against the local HF checkpoint + DeepSeek's
 shipped `inference/model.py`):** the vLLM draft model invented weights that do
@@ -134,21 +155,27 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Immediate Next Steps
 
-1. **Rebuild & cluster-test** (`9c83c59cb` + `b7aff3407`) — confirm the model
-   loads (the completeness assertion passes), serves, and re-measure acceptance.
-   With interim C, expect low-but-possibly-nonzero acceptance.
-2. **Implement proper C** (cross-attention) per `dspark/phase_cd_plan.md`
+1. **Diagnostic build** (`ecd5e8db4`, `DSPARK_DEBUG=1`) — rebuild both nodes,
+   one greedy request, collect `DSPARK_DEBUG` logs, localize the 0% cause.
+2. **Fix what the diagnostics reveal** — a smaller bug (alignment / Markov
+   scaling / context) and/or confirmation that fix C is the lever.
+3. **Implement proper C** (cross-attention) per `dspark/phase_cd_plan.md`
    (option (a): per-stage one-token main_kv prefill into the draft KV cache).
    Remove the interim embedding addition. Target >3/5 acceptance.
-3. **Verify Markov head end-to-end** against the reference `forward_head` loop.
-4. **Phase 3b: DSpark CUDA graphs** — build DSparkCudaGraphManager (see `phase3_cudagraph_plan.md`)
-5. **Phase 4: Confidence scheduling** — integrate confidence head
-6. **Phase 5: STS calibration** — calibrate acceptance thresholds
+4. **Verify Markov head end-to-end** against the reference `forward_head` loop.
+5. **Phase 3b: DSpark CUDA graphs** — build DSparkCudaGraphManager (see `phase3_cudagraph_plan.md`)
+6. **Phase 4: Confidence scheduling** — integrate confidence head
+7. **Phase 5: STS calibration** — calibrate acceptance thresholds
 
-## Risks to watch on first cluster build
+## Risks / open questions
 
-- `main_proj` fp8 scale: expects `main_proj.weight_scale_inv` param (created by
-  the fp8 quant method). If quant_config differs, the `.scale` load may need a
-  different suffix.
-- Fix D adds 3 extra `mhc_post_tilelang` calls (layers 40/41/42) per forward.
-- Interim C: acceptance may stay low until proper cross-attention lands.
+- `main_proj` fp8 scale: RESOLVED — the model loaded without a `KeyError` on
+  `main_proj.weight_scale_inv`, so the scale resolved. Sanity-check the projected
+  context magnitude via `ctx_norm` in the diagnostics.
+- Fix D adds 3 extra `mhc_post_tilelang` calls (layers 40/41/42) per forward —
+  watch for correctness/perf; confirm the captured context looks sane.
+- Interim C (context added to anchor embedding, not cross-attention) is the
+  leading suspect for 0% acceptance — but the diagnostics will confirm before we
+  invest in the cross-attention rewrite.
+- Keep both nodes on the SAME image — image skew caused the multi-node startup
+  failure (`Connection closed by peer`) on a prior build.

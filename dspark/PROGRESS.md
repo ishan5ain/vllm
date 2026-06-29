@@ -2,11 +2,12 @@
 
 > **Date:** 2026-06-28
 > **Branch:** `dspark-research` (fork: `github.com/ishan5ain/vllm`)
-> **Latest commit:** `b7aff3407` — fix weight loading exposed by completeness assertion
->   (on top of `9c83c59cb` — rewire draft model to match checkpoint layout A/B/D/E/F)
-> **State:** rewire + loader fixes COMMITTED & lint-clean; **pending cluster rebuild**
->   to confirm the model loads (assertion passes) and to re-measure acceptance.
-> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix
+> **Latest commit:** `ecd5e8db4` — env-gated diagnostics for the 0%-acceptance investigation
+>   (on `b7aff3407` weight-loading fix, `9c83c59cb` rewire A/B/D/E/F)
+> **State:** model LOADS & SERVES with all-real weights, output coherent, but draft
+>   acceptance is still **0%**. Diagnostic build committed; **pending cluster rebuild
+>   with `DSPARK_DEBUG=1`** to localize the cause before implementing fix C.
+> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix → loads-but-0%-acceptance → diagnostics
 
 ## Implementation Status
 
@@ -19,10 +20,51 @@ Phase 4: Scheduling       ░░░░░░░░░░░░ NOT STARTED
 Phase 5: STS Calibration  ░░░░░░░░░░░░ CODE EXISTS, NOT INTEGRATED
 ```
 
-## Current Status (2026-06-28)
+## Current Status (2026-06-29)
 
-**DSpark serves at O1 (PIECEWISE CUDA graphs) but draft acceptance is 0% across all
-5 positions.** The hc_head 2D→3D fix (`d4d66dfee`) is necessary but NOT sufficient.
+**The rewired model loads (79.4 GiB, all draft params real — assertion passes),
+serves at `http://spark10.local:8000/v1`, and generates coherent output — but
+draft acceptance is still 0%.** Next action: diagnostic build (`DSPARK_DEBUG=1`).
+
+### Acceptance re-measured after the rewire (2026-06-29)
+
+Fresh **greedy** request via `/v1/chat/completions` (greedy ⇒ a draft token is
+accepted iff it equals the target argmax), deltas from `/metrics`:
+
+| Metric | Δ |
+|---|---|
+| `spec_decode_num_drafts` | 159 |
+| `spec_decode_num_draft_tokens` | 795 (= 159 × γ=5) |
+| `spec_decode_num_accepted_tokens` | **0** |
+| acceptance rate / length | **0.00% / 1.000** |
+
+DSpark *is* proposing all 5 tokens/step; the target produces correct text (so the
+0% is purely the draft being rejected, not a serving failure). 0/795 *exact* is
+stronger than "weak context" alone → likely a systematic bug (anchor/position
+misalignment, Markov bias swamping base logits, or context not reaching the
+draft) in addition to the missing cross-attention. Hence diagnostics before fix C.
+
+### Diagnostics added — COMMITTED `ecd5e8db4` (env-gated, no-op unless enabled)
+
+`DSPARK_DEBUG=1` (cap via `DSPARK_DEBUG_CALLS`, default 3) dumps:
+- `forward_dspark_block` (`dspark.py`): anchor token, sampled draft tokens,
+  `target_context` norm/nan, and per-step `base_logits` top-5 vs post-Markov
+  top-5 with base/bias magnitudes (detects Markov bias swamping base logits).
+- `DSparkSpeculator.propose` (`speculator.py`): anchor tokens/positions/indices,
+  context shape/norm/nan, produced draft tokens (anchor/alignment sanity).
+
+Interpretation guide:
+- `ctx_norm≈0` / `ctx_nan=True` → context not reaching draft (capture/main_proj).
+- `bias_max ≫ base_max` & post-top5 unrelated to base-top5 → Markov head swamping.
+- `base_top5` gibberish/constant → backbone/hc_head bug; plausible → fix C is the lever.
+- anchor token ≠ last real token, or positions off → alignment bug.
+
+(Also removed pre-existing unused imports/locals in `speculator.py` so the
+touched file is ruff-clean.)
+
+### (Historical) hc_head fix — necessary but not sufficient
+
+The hc_head 2D→3D fix (`d4d66dfee`) is necessary but NOT sufficient.
 
 ### ROOT CAUSE — verified against the local checkpoint (2026-06-28)
 
@@ -193,9 +235,9 @@ vllm/model_executor/layers/sparse_attn_indexer.py  cooperative_topk Blackwell fi
 | Gap | Severity | Notes |
 |---|---|---|
 | Architecture mismatch vs checkpoint | RESOLVED (untested) | A/B/D/E/F rewired this session; assertion passes. Needs cluster build. |
-| **Context via cross-attention (fix C)** | **HIGH** | Only INTERIM (embedding add) in place. Proper per-stage `main_kv` cross-attention pending — see `dspark/phase_cd_plan.md`. Likely caps acceptance until done. |
-| Acceptance rate unverified | **HIGH** | Build A/B/D/E/F; expect low-but-maybe-nonzero with interim C; >3/5 needs proper C |
-| `main_proj` fp8 scale loading | Medium | Expects `main_proj.weight_scale_inv`; verify on first build |
+| **0% acceptance after rewire** | **BLOCKER** | Model loads/serves with real weights but 0/795 draft tokens accepted (greedy). Diagnostic build `ecd5e8db4` (`DSPARK_DEBUG=1`) pending to localize cause. |
+| **Context via cross-attention (fix C)** | **HIGH** | Only INTERIM (embedding add) in place. Proper per-stage `main_kv` cross-attention pending — see `dspark/phase_cd_plan.md`. Leading suspect for 0%. |
+| `main_proj` fp8 scale loading | Medium-RESOLVED | Model loaded without KeyError on `main_proj.weight_scale_inv`, so the fp8 scale resolved. Confirm value sanity via `ctx_norm` in diagnostics. |
 | Markov head correctness | Medium | Verified against paper + reference `forward_head` — logic correct; depends on correct inputs (now wired) |
 | Confidence head unused | Medium | Scores computed but Phase 4 scheduling not implemented |
 | No DSpark CUDA graphs | Medium | Main model has PIECEWISE graphs; speculator runs eagerly |
@@ -224,14 +266,26 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Next Steps (Priority Order)
 
-1. **Rebuild & cluster-test** (commits `9c83c59cb` + `b7aff3407`) — confirm the
-   model loads (completeness assertion passes), serves, and re-measure
-   acceptance with interim C. Watch the `main_proj` fp8 scale (expects
-   `main_proj.weight_scale_inv`) + the 3 extra `mhc_post` calls (fix D).
-2. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
+1. **Diagnostic build** (`ecd5e8db4`) — rebuild both nodes, launch with
+   `DSPARK_DEBUG=1`, send one short greedy request, collect `DSPARK_DEBUG` log
+   lines from BOTH nodes. Use the interpretation guide above to localize the
+   cause (context / alignment / Markov-swamp / backbone).
+2. **Fix whatever the diagnostics reveal.** Likely either a smaller bug
+   (alignment / Markov scaling / context) OR confirmation that fix C is the lever.
+3. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
    — per-stage one-token `main_kv` prefill into the draft KV cache; remove the
    interim embedding add. Target >3/5 acceptance.
-3. **Verify Markov head end-to-end** vs reference `forward_head`.
-4. **Phase 3b: DSpark CUDA graphs** — build `DSparkCudaGraphManager` (see `phase3_cudagraph_plan.md`)
-5. **Phase 4: Confidence-based scheduling** — integrate confidence head
-6. **Phase 5: STS calibration** — run `dspark/sts_calibration.py`
+4. **Verify Markov head end-to-end** vs reference `forward_head`.
+5. **Phase 3b: DSpark CUDA graphs** — build `DSparkCudaGraphManager` (see `phase3_cudagraph_plan.md`)
+6. **Phase 4: Confidence-based scheduling** — integrate confidence head
+7. **Phase 5: STS calibration** — run `dspark/sts_calibration.py`
+
+### How to run the diagnostic build
+
+```bash
+# rebuild from dspark-research @ ecd5e8db4, deploy to BOTH nodes (keep in sync)
+# launch with DSPARK_DEBUG=1 in the container env (e.g. -e DSPARK_DEBUG=1)
+# send one greedy request, then:
+docker logs <vllm-node> 2>&1 | grep DSPARK_DEBUG
+ssh 192.168.0.183 "docker logs <vllm-node> 2>&1 | grep DSPARK_DEBUG"
+```
