@@ -2,10 +2,11 @@
 
 > **Date:** 2026-06-28
 > **Branch:** `dspark-research` (fork: `github.com/ishan5ain/vllm`)
-> **Latest commit:** `d4d66dfee` — hc_head fix (3D backbone, pending cluster test)
-> **Uncommitted:** architecture rewire A/B/D/E/F + completeness assertion in
->   `dspark.py`/`model.py` (this session) — lint-clean, NOT yet committed/built/tested
-> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire
+> **Latest commit:** `b7aff3407` — fix weight loading exposed by completeness assertion
+>   (on top of `9c83c59cb` — rewire draft model to match checkpoint layout A/B/D/E/F)
+> **State:** rewire + loader fixes COMMITTED & lint-clean; **pending cluster rebuild**
+>   to confirm the model loads (assertion passes) and to re-measure acceptance.
+> **Sessions:** research → implementation → review → cluster testing → serving → debugging acceptance → checkpoint-verified root cause → architecture rewire → weight-loading fix
 
 ## Implementation Status
 
@@ -46,7 +47,7 @@ Full verified mapping, data flow, and the A–F fix table: see
 lists every parameter with no checkpoint source (token embedding + tied head
 exempt). After the rewire below it PASSES — every draft param has a real weight.
 
-### Architecture rewire — DONE this session (A/B/D/E/F), uncommitted/untested
+### Architecture rewire — COMMITTED `9c83c59cb` (A/B/D/E/F), pending rebuild
 
 | Fix | Change | File |
 |---|---|---|
@@ -58,10 +59,10 @@ exempt). After the rewire below it PASSES — every draft param has a real weigh
 
 Lint-clean (ruff check + format). Not built/tested — cluster build is the test.
 
-#### Loader fixes from first cluster build (assertion caught 25 unloaded params)
+#### Loader fixes — COMMITTED `b7aff3407` (assertion caught 25 unloaded params)
 
-The completeness assertion fired on the first build and surfaced bugs (most
-pre-existing, silently random before):
+The first cluster build with the rewire hit the completeness assertion (25
+unloaded params) and surfaced bugs (most pre-existing, silently random before):
 
 - **Removed the `if name not in params_dict: continue` guard** in the weight
   loop (added a prior session to skip main_norm/main_proj). It fired *before*
@@ -76,7 +77,8 @@ pre-existing, silently random before):
 - **`confidence_proj` created with `bias=False`** (checkpoint has no bias).
 
 After these, every draft param has a checkpoint source (embedding + tied head
-shared) and the assertion passes. Still untested beyond load.
+shared) and the assertion is expected to pass. **Not yet rebuilt/re-run** — the
+0% acceptance below predates the rewire+loader fixes and should be re-measured.
 
 Prior hypothesis (hc_head identical-copies bug) remains valid but was only one of
 several issues; it could not have raised acceptance above 0% on its own.
@@ -222,9 +224,10 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Next Steps (Priority Order)
 
-1. **Build & cluster-test the A/B/D/E/F rewire** — confirm load (assertion
-   passes), serving, and measure acceptance with interim C. Watch the
-   `main_proj` fp8 scale + the 3 extra `mhc_post` calls (fix D).
+1. **Rebuild & cluster-test** (commits `9c83c59cb` + `b7aff3407`) — confirm the
+   model loads (completeness assertion passes), serves, and re-measure
+   acceptance with interim C. Watch the `main_proj` fp8 scale (expects
+   `main_proj.weight_scale_inv`) + the 3 extra `mhc_post` calls (fix D).
 2. **Implement proper fix C** (cross-attention) per `dspark/phase_cd_plan.md`
    — per-stage one-token `main_kv` prefill into the draft KV cache; remove the
    interim embedding add. Target >3/5 acceptance.
