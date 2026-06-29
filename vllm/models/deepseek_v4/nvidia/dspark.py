@@ -270,6 +270,7 @@ class DSparkInnerModel(nn.Module):
         self.confidence_proj = ReplicatedLinear(
             config.hidden_size + self.markov_rank,
             1,
+            bias=False,
             prefix=maybe_prefix(prefix, "confidence_proj"),
         )
         # Target-context projection lives on the input stage (mtp.0) as
@@ -611,6 +612,20 @@ class DSparkInnerModel(nn.Module):
             name = _remap_weight_name(name)
             name = self._rewrite_spec_layer_name(spec_layer, name)
 
+            # Top-level DSpark heads (promoted off the output stage) load
+            # directly. Handle them before the stacked-params loop because
+            # "markov_w1" collides with the "w1" stacked weight-name substring.
+            if name in (
+                "markov_w1.weight",
+                "markov_w2.weight",
+                "confidence_proj.weight",
+            ):
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
+
             if spec_layer != self.mtp_start_layer_idx and "layers." not in name:
                 continue
             if name.endswith(".scale"):
@@ -632,11 +647,6 @@ class DSparkInnerModel(nn.Module):
                 loaded_params.add(name)
                 break
             else:
-                if name not in params_dict:
-                    # Some DSpark checkpoint weights (e.g., main_norm,
-                    # main_proj from the MTP architecture) may not have
-                    # corresponding parameters in the DSpark model.
-                    continue
                 if ".experts." in name:
                     if (
                         "weight_scale" in name

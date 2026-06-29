@@ -58,6 +58,26 @@ exempt). After the rewire below it PASSES — every draft param has a real weigh
 
 Lint-clean (ruff check + format). Not built/tested — cluster build is the test.
 
+#### Loader fixes from first cluster build (assertion caught 25 unloaded params)
+
+The completeness assertion fired on the first build and surfaced bugs (most
+pre-existing, silently random before):
+
+- **Removed the `if name not in params_dict: continue` guard** in the weight
+  loop (added a prior session to skip main_norm/main_proj). It fired *before*
+  the expert loader and the `shared_experts.w2→down_proj` / `gate.bias→
+  e_score_correction_bias` renames — so MoE experts (non-mega path uses
+  `experts.routed_experts.*`), shared-expert down_proj, and the gate bias were
+  never loading. Now matches the proven `mtp.py` loader. main_proj/main_norm
+  load directly (they are real params now).
+- **markov/confidence load explicitly before the stacked-params loop** —
+  `markov_w1` collides with the `"w1"` stacked weight-name substring; also the
+  `spec_layer != mtp_start` guard had skipped these mtp.2-only heads.
+- **`confidence_proj` created with `bias=False`** (checkpoint has no bias).
+
+After these, every draft param has a checkpoint source (embedding + tied head
+shared) and the assertion passes. Still untested beyond load.
+
 Prior hypothesis (hc_head identical-copies bug) remains valid but was only one of
 several issues; it could not have raised acceptance above 0% on its own.
 
