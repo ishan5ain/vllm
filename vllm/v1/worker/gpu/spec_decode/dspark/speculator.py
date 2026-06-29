@@ -362,6 +362,23 @@ class DSparkSpeculator(DraftModelSpeculator):
                 ctx_buf = target_model.get_dspark_context_hidden_states()
                 if ctx_buf is not None:
                     target_context_all = ctx_buf
+        if _dspark_dbg_should_log():
+            tm = getattr(self, "_target_model", None)
+            getter = getattr(tm, "get_dspark_context_hidden_states", None)
+            buf = getter() if callable(getter) else None
+            ctx_shape = (
+                None if target_context_all is None else tuple(target_context_all.shape)
+            )
+            aux_len = None if aux_hidden_states is None else len(aux_hidden_states)
+            _dspark_dbg_emit(
+                "DSPARK_DEBUG propose-entry: "
+                f"num_reqs={input_batch.num_reqs} aux={aux_len} "
+                f"target_model={type(tm).__name__ if tm is not None else None} "
+                f"has_getter={callable(getter)} "
+                f"getter_buf={None if buf is None else tuple(buf.shape)} "
+                f"ctx_is_none={target_context_all is None} ctx_shape={ctx_shape}"
+            )
+
         if target_context_all is None:
             # No DSpark context available — return empty draft tokens.
             # This should not happen in normal operation; the target model
