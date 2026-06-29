@@ -3,11 +3,11 @@
 > **🔁 2026-06-29 PIVOT:** We are adopting the upstream
 > [vLLM PR #46995](https://github.com/vllm-project/vllm/pull/46995) instead of
 > our hand-rolled integration. Start with **`PR_46995_COMPARISON.md`** and
-> **`MIGRATION_PLAN.md`**. The hand-rolled docs below (and `phase_cd_plan.md`)
-> are now historical; the weight anatomy in `checkpoint_anatomy.md` remains
-> confirmed and valid.
+> **`MIGRATION_PLAN.md`**. The hand-rolled-attempt docs have been moved to
+> **`archive/`**; the weight anatomy in `checkpoint_anatomy.md` remains confirmed
+> and valid.
 
-## Files in this directory
+## Active docs
 
 | File | Purpose |
 |---|---|
@@ -15,11 +15,23 @@
 | `MIGRATION_PLAN.md` | **(then here)** Step-by-step adoption of PR #46995 (keep/replace/delete/add per file, phases, GB10 risk) |
 | `PROGRESS.md` | Progress & state (pivot note at top; hand-rolled history below) |
 | `HANDOFF.md` | Handoff (pivot note at top; hand-rolled history below) |
-| `IMPLEMENTATION_PLAN.md` | Full implementation roadmap, phases 1-5, open questions (historical) |
-| `ALGORITHM_REFERENCE.md` | Paper equations, inference flow, production adaptations |
 | `checkpoint_anatomy.md` | Exact weight structure, shapes, layer mapping (✅ confirmed by PR #46995) |
-| `phase_cd_plan.md` | Our hand-rolled cross-attention design (SUPERSEDED by PR's Sparse-MLA approach) |
-| `dspark_model_skeleton.py` | Python skeleton with class stubs and weight loading map (historical) |
+
+## Reference (still valid)
+
+| File | Purpose |
+|---|---|
+| `ALGORITHM_REFERENCE.md` | Paper equations, inference flow, production adaptations |
+| `DSpark_paper_full.md` | OCR'd DSpark paper |
+| `backend_compatibility.md` | Attention/kernel backend compatibility notes (relevant to GB10 Sparse-MLA validation) |
+| `gb10_recipes_analysis.md` | GB10 / DGX Spark platform + recipe notes (relevant to M2/M3 build & serve) |
+
+## `archive/` — hand-rolled-attempt artifacts (historical)
+
+Superseded by the pivot; kept for reference (weight archaeology, phase notes,
+reviews, profiling, STS calibration code). Notable: `phase_cd_plan.md` (our
+hand-rolled cross-attention design, replaced by the PR's Sparse-MLA index
+expansion), `IMPLEMENTATION_PLAN.md`, `dspark_model_skeleton.py`.
 
 ## External References
 

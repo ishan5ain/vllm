@@ -91,9 +91,10 @@ If the merge is messy, fall back to the **file-by-file port** in the table below
 | `tests/v1/attention/test_dspark_noncausal_sparse_mla.py` | (none) | **ADD** | 529-line correctness suite for the non-causal sparse path. Run it (see risks). |
 
 ### Docs (this directory) — keep, but re-frame
-`checkpoint_anatomy.md` stays valid (weight anatomy confirmed). `phase_cd_plan.md`
-(our hand-rolled cross-attention design) is **superseded** by the PR's
-sparse-index + KV-precompute approach — mark it historical, don't delete.
+`checkpoint_anatomy.md` stays valid (weight anatomy confirmed). The hand-rolled
+artifacts now live in `dspark/archive/` — notably `archive/phase_cd_plan.md`
+(our cross-attention design), **superseded** by the PR's sparse-index +
+KV-precompute approach. Kept for reference, not deleted.
 
 ## 🚨 Top risk to validate FIRST: GB10 (sm_121) Sparse-MLA support
 
