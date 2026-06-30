@@ -362,12 +362,14 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 See `dspark/MIGRATION_PLAN.md` for the detailed, file-by-file plan. Summary:
 
-1. **Phase M0 — Merge the PR.** `git fetch https://github.com/benchislett/vllm.git
-   dspark:pr-46995`, tag our work (`git tag dspark-handrolled-archive`), then
-   `git merge pr-46995`. Resolve conflicts by taking the PR side except for our
-   GB10 keeps (`sparse_attn_indexer.py` cooperative_topk fallback). Delete the
-   obsolete files (`dspark_proposer.py`, our diagnostics scaffolding).
-2. **Phase M1 — GB10 kernel validation (BLOCKER).** Run
+1. **✅ DONE — Phase M0: adopt the PR** (commit `fe8afd81c`). **Cherry-picked**
+   the PR feature commit `8b82d11` (the PR branch is rebased on a newer main, so a
+   full merge would pull ~140 unrelated files — the feature is one 19-file
+   commit). 4 conflicts (all our hand-rolled DSpark files), reconciled the
+   auto-merged files, deleted `dspark_proposer.py` + V1 DSpark wiring, kept the
+   cooperative_topk fallback. `py_compile`-clean. ⚠️ dspark now requires explicit
+   `method: dspark` (auto-detect removed) — verify the cluster recipe.
+2. **➡️ NEXT — Phase M1: GB10 kernel validation (BLOCKER).** Run
    `tests/v1/attention/test_dspark_noncausal_sparse_mla.py` on the GB10 box.
    Confirm a Sparse-MLA backend (FlashMLA / FlashInfer TRTLLM) passes on sm_121,
    or arrange a fallback.

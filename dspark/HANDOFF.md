@@ -198,16 +198,20 @@ ssh 192.168.0.183 "docker tag vllm-node:latest vllm-node:dspark"
 
 ## Immediate Next Steps — POST-PIVOT (see `dspark/MIGRATION_PLAN.md`)
 
-1. **Merge PR #46995** (`git fetch https://github.com/benchislett/vllm.git
-   dspark:pr-46995`; `git tag dspark-handrolled-archive`; `git merge pr-46995`).
-   Take the PR side on conflicts; keep our `sparse_attn_indexer.py` cooperative_topk
-   fallback; delete `dspark_proposer.py` + our diagnostics scaffolding.
-2. **Validate Sparse-MLA on GB10 (sm_121) — BLOCKER.** Run
+1. **✅ DONE — Phase M0: adopt PR #46995** (commit `fe8afd81c`). Cherry-picked the
+   PR feature commit `8b82d11` (not a branch merge — see plan), resolved 4
+   conflicts, reconciled auto-merged files, deleted `dspark_proposer.py` + V1
+   wiring, kept our cooperative_topk fallback. All files `py_compile`-clean.
+   ⚠️ **dspark now needs an explicit `method: dspark`** in the speculative config
+   — verify the cluster recipe passes it before M2.
+2. **➡️ NEXT — Phase M1: validate Sparse-MLA on GB10 (sm_121) — BLOCKER.** Run
    `tests/v1/attention/test_dspark_noncausal_sparse_mla.py` on the box; confirm a
-   backend passes or arrange a fallback.
-3. **Build & serve** from the migrated branch (both nodes, same image).
-4. **Measure acceptance** (greedy, `/metrics`). Target AL ≈ 5.
-5. **Reconcile Flash config** field names (`n_mtp_layers`, `dspark_*`, `hc_*`).
+   backend (FlashMLA / FlashInfer TRTLLM) passes on sm_121 or arrange a fallback.
+3. **Phase M2: build & serve** from this branch (both nodes, same image). Run
+   `pre-commit`/`ruff` on the build (not done on the dev box).
+4. **Phase M3: measure acceptance** (greedy, `/metrics`). Target AL ≈ 5.
+5. **Phase M4: reconcile Flash config** field names (`n_mtp_layers`, `dspark_*`,
+   `hc_*`).
 
 Deferred (out of scope upstream too): confidence scheduling, dynamic drafting,
 STS calibration.

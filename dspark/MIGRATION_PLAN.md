@@ -117,9 +117,26 @@ attention path:
 
 ## Phased execution
 
-- **Phase M0 — Validate foundation (no cluster):** merge the PR into a scratch
-  branch; resolve conflicts per the table; `ruff`/import-check; run the new
-  non-causal test on any available SM100/SM120 box if the GB10 is busy.
+- **Phase M0 — Validate foundation (no cluster): ✅ DONE 2026-06-29 (commit
+  `fe8afd81c`).** We **cherry-picked** the PR's feature commit (`8b82d11`) rather
+  than merging the branch — the PR branch is rebased on a much newer `main`, so a
+  full merge would have dragged in ~140 files of unrelated upstream churn; the
+  feature itself is a single 19-file commit. Outcome:
+  - Only **4 git conflicts**, all in our hand-rolled DSpark files. The 15
+    shared-infra files (sparse_swa.py, vllm.py, scheduler.py, eagle3_utils.py,
+    qwen3_dflash.py, utils.py, etc.) **auto-merged cleanly**.
+  - Resolved + reconciled per the table below; deleted `dspark_proposer.py`;
+    removed all V1-runner DSpark wiring (DSpark is forced to the V2 runner);
+    removed our `_dspark_context_buffer`, `deepseek_dspark` model_type, and a
+    duplicate speculator route. All touched files pass `py_compile`.
+  - `SupportsEagle3`/`EagleModelMixin` contract verified satisfied by the mixins
+    (interfaces.py) — no extra methods needed on `DeepseekV4ForCausalLM`.
+  - ⚠️ **Behavior change:** dspark now requires an **explicit `method: dspark`**
+    in the speculative config (we dropped auto-detection from `dspark_block_size`).
+    **The cluster recipe must pass `method: dspark`** (verify in spark-vllm-docker
+    `run-recipe.sh` / the deepseek-v4-flash-dspark recipe before M2).
+  - Not done here: `ruff`/`pre-commit` (no venv on the dev box) — runs on the
+    cluster build. Non-causal test deferred to M1 (needs GPU).
 - **Phase M1 — GB10 kernel validation:** run `test_dspark_noncausal_sparse_mla.py`
   on the GB10 cluster. Decide backend (FlashMLA / FlashInfer TRTLLM / fallback).
   **Gate:** a sparse-MLA backend passes on sm_121, or a fallback is in place.
